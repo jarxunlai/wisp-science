@@ -265,6 +265,32 @@ test("settings modal shows the saved provider", async ({ page }) => {
   await page.getByRole("button", { name: "Cancel" }).click();
 });
 
+test("codex runner sandbox selection is saved", async ({ page }) => {
+  await enterApp(page);
+  await openModelsSettings(page);
+
+  await providerSelect(page).selectOption("codex_cli");
+  await expect(page.getByLabel("danger-full-access")).toBeChecked();
+  await page.getByLabel("workspace-write").check();
+  await expect(page.getByLabel("workspace-write")).toBeChecked();
+
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect.poll(async () => page.evaluate(() => {
+    const plain = (value: any): any => {
+      if (value instanceof Map) return Object.fromEntries([...value].map(([k, v]) => [k, plain(v)]));
+      if (Array.isArray(value)) return value.map(plain);
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, plain(v)]));
+      return value;
+    };
+    const calls = ((window as any).__skillInvokeLog ?? []).filter((c: any) => c.cmd === "save_model");
+    return plain(calls.at(-1)?.args ?? null)?.profile ?? null;
+  })).toMatchObject({
+    provider: "codex_cli",
+    model: "inherit",
+    runner_sandbox: "workspace-write",
+  });
+});
+
 test("vision assignment keeps model fields and stored key placeholder untouched", async ({ page }) => {
   await enterApp(page);
   await openModelsSettings(page);

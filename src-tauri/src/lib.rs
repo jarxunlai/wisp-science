@@ -1695,17 +1695,49 @@ fn local_bridge_launch(
     }
 }
 
-fn local_runner_session_key(provider: &str, frame_id: &str) -> String {
-    format!("local_runner_session:{provider}:{frame_id}")
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn local_runner_settings_fingerprint(
+    provider: &str,
+    settings: &local_runner::LocalRunnerSettings,
+) -> String {
+    let sandbox = local_runner::default_runner_sandbox(&settings.sandbox);
+    let fields = [
+        provider.trim(),
+        settings.command.trim(),
+        settings.profile.trim(),
+        sandbox.as_str(),
+        if settings.web_search { "web=1" } else { "web=0" },
+        settings.model.trim(),
+        settings.claude_command.trim(),
+    ];
+    format!("{:016x}", fnv1a64(fields.join("\0").as_bytes()))
+}
+
+fn local_runner_session_key(
+    provider: &str,
+    frame_id: &str,
+    settings: &local_runner::LocalRunnerSettings,
+) -> String {
+    let fingerprint = local_runner_settings_fingerprint(provider, settings);
+    format!("local_runner_session:{provider}:{fingerprint}:{frame_id}")
 }
 
 async fn load_local_runner_session_id(
     store: &Store,
     provider: &str,
     frame_id: &str,
+    settings: &local_runner::LocalRunnerSettings,
 ) -> Option<String> {
     store
-        .get_setting(&local_runner_session_key(provider, frame_id))
+        .get_setting(&local_runner_session_key(provider, frame_id, settings))
         .await
         .ok()
         .flatten()
@@ -1717,12 +1749,13 @@ async fn save_local_runner_session_id(
     store: &Store,
     provider: &str,
     frame_id: &str,
+    settings: &local_runner::LocalRunnerSettings,
     session_id: &str,
 ) {
     let session_id = session_id.trim();
     if !session_id.is_empty() {
         let _ = store
-            .set_setting(&local_runner_session_key(provider, frame_id), session_id)
+            .set_setting(&local_runner_session_key(provider, frame_id, settings), session_id)
             .await;
     }
 }
@@ -1781,7 +1814,7 @@ async fn run_local_runner_turn(
 
     let runner_settings = models::active_runner_settings(&state.store).await;
     let stored_external_session = if runner_settings.persistent {
-        load_local_runner_session_id(&state.store, &provider, &frame_id).await
+        load_local_runner_session_id(&state.store, &provider, &frame_id, &runner_settings).await
     } else {
         None
     };
@@ -1996,7 +2029,7 @@ async fn run_local_runner_turn(
     }
     if runner_settings.persistent {
         if let Some(session_id) = observed_external_session.or(command_external_session) {
-            save_local_runner_session_id(&state.store, &provider, &frame_id, &session_id).await;
+            save_local_runner_session_id(&state.store, &provider, &frame_id, &runner_settings, &session_id).await;
         }
     }
     let mut assistant = Message::assistant(final_text.clone());
@@ -5606,6 +5639,7 @@ pub fn run_mcp_oneshot_cli() {
 #[cfg(test)]
 mod tests {
     use super::{
+        local_runner_session_key,
         copy_dir_recursive, parse_disabled_skills, parse_enabled_skill_names, parse_skill_tags,
         resolve_workspace, session_runtime_status, McpConnection, McpTransport,
     };
@@ -5792,6 +5826,29 @@ mod tests {
         assert!(parse_enabled_skill_names(Some("not json".into()))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn local_runner_session_key_changes_with_sandbox() {
+        let mut settings = crate::local_runner::LocalRunnerSettings {
+            command: "codex".into(),
+            profile: "default".into(),
+            sandbox: "danger-full-access".into(),
+            web_search: false,
+            model: "inherit".into(),
+            claude_command: String::new(),
+            persistent: true,
+        };
+        let danger = local_runner_session_key("codex_cli", "frame-1", &settings);
+        settings.sandbox = "workspace-write".into();
+        let workspace = local_runner_session_key("codex_cli", "frame-1", &settings);
+        settings.sandbox = "read-only".into();
+        let read_only = local_runner_session_key("codex_cli", "frame-1", &settings);
+
+        assert_ne!(danger, workspace);
+        assert_ne!(workspace, read_only);
+        assert!(workspace.contains("codex_cli"));
+        assert!(workspace.ends_with(":frame-1"));
     }
 
     #[test]

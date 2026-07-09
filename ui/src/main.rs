@@ -2654,6 +2654,7 @@ fn App() -> impl IntoView {
     let model_form = create_rw_signal(None::<ModelForm>);
     let model_form_key = create_rw_signal(String::new());
     let model_form_msg = create_rw_signal(None::<(bool, String)>);
+    let model_runner_sandbox = create_rw_signal(String::from("danger-full-access"));
     let specialists = create_rw_signal::<Vec<Specialist>>(vec![]);
     let specialist_form = create_rw_signal::<Option<Specialist>>(None);
     let specialist_form_open = create_memo(move |_| specialist_form.get().is_some());
@@ -3660,7 +3661,10 @@ fn App() -> impl IntoView {
 
     let save_model_form = move |_| {
         if settings_busy.get() { return; }
-        let Some(form) = model_form.get() else { return; };
+        let Some(mut form) = model_form.get() else { return; };
+        if provider_value(&form.provider) == "codex_cli" {
+            form.runner_sandbox = model_runner_sandbox.get();
+        }
         let loc = locale.get();
         let key = model_form_key.get();
         let has_key = form.id.as_ref()
@@ -5217,7 +5221,9 @@ fn App() -> impl IntoView {
                                             }}
                                             <button type="button" class="model-menu-add" on:click=move |_| {
                                                 model_menu_open.set(false);
-                                                model_form.set(Some(new_model_form()));
+                                                let form = new_model_form();
+                                                model_runner_sandbox.set(form.runner_sandbox.clone());
+                                                model_form.set(Some(form));
                                                 model_form_key.set(String::new());
                                                 model_form_msg.set(None);
                                                 open_settings_fn(Some("models".into()));
@@ -6057,6 +6063,9 @@ fn App() -> impl IntoView {
                                                                 if provider_value(&p) == "codex_cli" && o.runner_sandbox.is_empty() {
                                                                     o.runner_sandbox = "danger-full-access".into();
                                                                 }
+                                                                if provider_value(&p) == "codex_cli" {
+                                                                    model_runner_sandbox.set(o.runner_sandbox.clone());
+                                                                }
                                                             });
                                                         }
                                                         prop:value=move || model_form.get().map(|f| provider_value(&f.provider).to_string()).unwrap_or_else(|| "openai".into())>
@@ -6144,15 +6153,31 @@ fn App() -> impl IntoView {
                                                             <input prop:value=move || model_form.get().map(|f| f.runner_profile.clone()).unwrap_or_default()
                                                                 placeholder="default"
                                                                 on:input=move |ev| model_form.update(|o| if let Some(o)=o { o.runner_profile = event_target_input(&ev).value(); }) /></label>
-                                                        <label>{move || t(locale.get(), "settings.runner_sandbox")}
-                                                            <select
-                                                                on:change=move|ev| model_form.update(|o| if let Some(o)=o { o.runner_sandbox = dom_value(&ev); })
-                                                                prop:value=move || model_form.get().map(|f| if f.runner_sandbox.is_empty() { "danger-full-access".into() } else { f.runner_sandbox }).unwrap_or_else(|| "danger-full-access".into())>
-                                                                <option value="danger-full-access">"danger-full-access"</option>
-                                                                <option value="workspace-write">"workspace-write"</option>
-                                                                <option value="read-only">"read-only"</option>
-                                                            </select>
-                                                        </label>
+                                                        <div>
+                                                            <span class="settings-label">{move || t(locale.get(), "settings.runner_sandbox")}</span>
+                                                            <div class="runner-sandbox-options">
+                                                                {["danger-full-access", "workspace-write", "read-only"].into_iter().map(|mode| {
+                                                                    let mode = mode.to_string();
+                                                                    let mode_for_value = mode.clone();
+                                                                    let mode_for_checked = mode.clone();
+                                                                    let mode_for_change = mode.clone();
+                                                                    view! {
+                                                                        <label class="settings-check runner-sandbox-option">
+                                                                            <input type="radio" name="runner-sandbox"
+                                                                                value=mode_for_value
+                                                                                prop:checked=move || model_runner_sandbox.get() == mode_for_checked
+                                                                                on:change=move|ev| {
+                                                                                    if event_target_checked(&ev) {
+                                                                                        model_runner_sandbox.set(mode_for_change.clone());
+                                                                                        model_form.update(|o| if let Some(o)=o { o.runner_sandbox = mode_for_change.clone(); });
+                                                                                    }
+                                                                                } />
+                                                                            <span>{mode}</span>
+                                                                        </label>
+                                                                    }
+                                                                }).collect_view()}
+                                                            </div>
+                                                        </div>
                                                         <label class="settings-check span-2">
                                                             <input type="checkbox"
                                                                 prop:checked=move || model_form.get().map(|f| f.runner_web_search).unwrap_or(false)
@@ -6221,7 +6246,9 @@ fn App() -> impl IntoView {
                                             format!("{} ({n})", t(locale.get(), "settings.nav.models"))
                                         }}</span>
                                         <button type="button" class="settings-add-btn" on:click=move |_| {
-                                            model_form.set(Some(new_model_form()));
+                                            let form = new_model_form();
+                                            model_runner_sandbox.set(form.runner_sandbox.clone());
+                                            model_form.set(Some(form));
                                             model_form_key.set(String::new());
                                             model_form_msg.set(None);
                                         }>{move || t(locale.get(), "models.add")}</button>
@@ -6239,7 +6266,9 @@ fn App() -> impl IntoView {
                                                     <div class="settings-list-row settings-list-row-link"
                                                         class:settings-list-row-active=is_active
                                                         on:click=move |_| {
-                                                            model_form.set(Some(profile_to_form(&edit)));
+                                                            let form = profile_to_form(&edit);
+                                                            model_runner_sandbox.set(form.runner_sandbox.clone());
+                                                            model_form.set(Some(form));
                                                             model_form_key.set(String::new());
                                                             model_form_msg.set(None);
                                                         }>
