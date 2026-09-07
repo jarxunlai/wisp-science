@@ -42,6 +42,15 @@ pub fn proxy_env(proxy: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    fn env_value<'a>(
+        envs: &'a std::collections::HashMap<String, String>,
+        name: &str,
+    ) -> Option<&'a str> {
+        envs.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     #[test]
     fn child_environment_overrides_inherited_proxy_without_changing_parent() {
         let mut command = std::process::Command::new("unused");
@@ -57,13 +66,22 @@ mod tests {
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(envs["HTTPS_PROXY"], "http://localhost:7890");
-        assert_eq!(envs["https_proxy"], "http://localhost:7890");
-        assert_eq!(envs["no_proxy"], "");
+        // Windows collapses proxy names case-insensitively; both casings must
+        // still resolve to the explicit child override.
+        assert_eq!(
+            env_value(&envs, "HTTPS_PROXY"),
+            Some("http://localhost:7890")
+        );
+        assert_eq!(
+            env_value(&envs, "https_proxy"),
+            Some("http://localhost:7890")
+        );
+        assert_eq!(env_value(&envs, "no_proxy"), Some(""));
         command.envs(proxy_env("none"));
-        assert!(command
-            .get_envs()
-            .any(|(k, v)| k == "NO_PROXY" && v == Some(std::ffi::OsStr::new("*"))));
+        assert!(command.get_envs().any(|(k, v)| {
+            k.to_string_lossy().eq_ignore_ascii_case("NO_PROXY")
+                && v == Some(std::ffi::OsStr::new("*"))
+        }));
     }
 
     #[test]

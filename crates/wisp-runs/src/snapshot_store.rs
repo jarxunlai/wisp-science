@@ -194,17 +194,20 @@ fn verify_blob(path: &Path, expected_checksum: &str, expected_size: u64) -> Resu
 
 fn reject_project_symlinks(project_root: &Path, source: &Path) -> Result<(), String> {
     // macOS exposes the temporary directory through `/var` while canonical
-    // input paths use `/private/var`. Compare against the physical root so a
-    // path that is genuinely inside the project is not rejected.
+    // input paths use `/private/var`. Windows may mix 8.3 short names with
+    // long paths, and `std::fs::canonicalize` adds a `\\?\` prefix that
+    // dunce strips. Compare against the physical root so a path that is
+    // genuinely inside the project is not rejected.
     let logical_root = project_root;
-    let project_root = logical_root
-        .canonicalize()
-        .unwrap_or_else(|_| logical_root.to_path_buf());
+    let project_root =
+        dunce::canonicalize(logical_root).unwrap_or_else(|_| logical_root.to_path_buf());
     let source = if source.is_absolute() {
         source
             .strip_prefix(logical_root)
             .map(|relative| project_root.join(relative))
-            .unwrap_or_else(|_| source.to_path_buf())
+            .unwrap_or_else(|_| {
+                dunce::canonicalize(source).unwrap_or_else(|_| source.to_path_buf())
+            })
     } else {
         project_root.join(source)
     };
@@ -286,6 +289,18 @@ mod tests {
         let error = capture_file(&root, &source, SnapshotPolicy::Always).unwrap_err();
         assert!(error.contains("corruption"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_canonical_sources_under_a_noncanonical_windows_root() {
+        let root = std::env::temp_dir().join(format!("wisp_snapshot_win_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("results")).unwrap();
+        let source = root.join("results/table.tsv");
+        std::fs::write(&source, b"a\tb\n1\t2\n").unwrap();
+        let canonical_source = dunce::canonicalize(&source).unwrap();
+        let copied = capture_file(&root, &canonical_source, SnapshotPolicy::Always).unwrap();
+        assert_eq!(copied.size_bytes, 8);
         let _ = std::fs::remove_dir_all(root);
     }
 

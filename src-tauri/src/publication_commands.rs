@@ -851,7 +851,8 @@ mod tests {
             workspace.lineage[0].exact_version_id.as_deref(),
             Some("artifact-v2")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -914,6 +915,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        std::fs::remove_dir_all(root).unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
