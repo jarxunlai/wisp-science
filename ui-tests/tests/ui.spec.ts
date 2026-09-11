@@ -8941,7 +8941,7 @@ for (const locale of ["en", "zh"]) {
     await expect(effort).toHaveAccessibleDescription(/.+/);
     const image = page.getByTestId("use-for-image-generation");
     const video = page.getByTestId("use-for-video-generation");
-    await expect(image).toHaveAccessibleDescription(/Custom model IDs/);
+    await expect(image).toHaveAccessibleDescription(locale === "zh" ? /自定义模型 ID/ : /Custom model IDs/);
     await expect(video).toHaveAccessibleDescription(/grok-imagine-video/);
     for (const width of [1440, 640]) {
       await page.setViewportSize({ width, height: 1200 });
@@ -8970,7 +8970,13 @@ for (const locale of ["en", "zh"]) {
       expect(await form.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
       await form.screenshot({ animations: "disabled", path: testInfo.outputPath(`model-explanations-${locale}-${width}.png`) });
     }
+    await video.check();
     await image.check();
+    // Explicit image intent now switches arbitrary IDs to the image-only form.
+    await expect(image).toBeChecked();
+    await expect(video).toHaveCount(0);
+    await image.uncheck();
+    await expect(video).not.toBeChecked();
     await video.check();
     await expect(image).not.toBeChecked();
     await expect(video).toBeChecked();
