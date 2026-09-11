@@ -10,7 +10,9 @@ pub(super) fn resolve_input_paths(root: &Path, refs: &[String]) -> Result<Vec<Pa
     if refs.is_empty() {
         return Ok(Vec::new());
     }
-    let canonical_root = std::fs::canonicalize(root)
+    // Match snapshot_store and native tool paths: Windows verbatim paths
+    // cannot be lexically compared to their ordinary drive-letter roots.
+    let canonical_root = dunce::canonicalize(root)
         .map_err(|e| format!("cannot resolve project root {}: {e}", root.display()))?;
     let mut names = HashSet::new();
     refs.iter()
@@ -28,7 +30,7 @@ pub(super) fn resolve_input_paths(root: &Path, refs: &[String]) -> Result<Vec<Pa
                 return Err(format!("SSH input must be project-relative: {value}"));
             }
             let candidate = canonical_root.join(relative);
-            let path = std::fs::canonicalize(&candidate)
+            let path = dunce::canonicalize(&candidate)
                 .map_err(|e| format!("cannot resolve SSH input {value}: {e}"))?;
             if !path.starts_with(&canonical_root) || !path.is_file() {
                 return Err(format!("SSH input is not a project file: {value}"));

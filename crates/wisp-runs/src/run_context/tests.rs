@@ -3738,6 +3738,27 @@ async fn cleanup_refuses_while_an_external_reference_points_into_the_workdir() {
 
 // --- remote staging ledger ---------------------------------------------------
 
+#[test]
+fn ssh_input_paths_remain_compatible_with_artifact_snapshots() {
+    let root = std::env::temp_dir().join(format!("wisp_staging_snapshot_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("input.fasta"), b">seq\nACGT\n").unwrap();
+    let paths = resolve_input_paths(&root, &["input.fasta".into()]).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        paths[0],
+        dunce::canonicalize(root.join("input.fasta")).unwrap()
+    );
+    let snapshot = crate::snapshot_store::capture_file(
+        &root,
+        &paths[0],
+        crate::snapshot_store::SnapshotPolicy::Reference,
+    )
+    .unwrap();
+    assert_eq!(snapshot.size_bytes, 10);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn ssh_input_staging_ledgers_uploaded_files() {
     let tmp = std::env::temp_dir().join(format!("wisp_staging_ledger_{}", uuid::Uuid::new_v4()));
