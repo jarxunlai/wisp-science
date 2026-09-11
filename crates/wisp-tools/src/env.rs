@@ -337,7 +337,8 @@ pub trait ToolEnv: Send + Sync {
 pub struct ToolResult {
     pub success: bool,
     pub content: String,
-    pub image: Option<ImageData>,
+    /// Model-visible images accompanying (not replacing) the text result.
+    pub images: Vec<ImageData>,
     /// Code-level control flow for the agent loop. This keeps user-decision
     /// boundaries out of prompt wording: stale sibling calls can be skipped,
     /// and tools such as `ask_user` can end the turn outright.
@@ -365,7 +366,7 @@ impl ToolResult {
         Self {
             success: true,
             content: content.into(),
-            image: None,
+            images: Vec::new(),
             control: ToolControl::Continue,
         }
     }
@@ -373,7 +374,7 @@ impl ToolResult {
         Self {
             success: false,
             content: content.into(),
-            image: None,
+            images: Vec::new(),
             control: ToolControl::Continue,
         }
     }
@@ -382,7 +383,7 @@ impl ToolResult {
         Self {
             success: true,
             content: label,
-            image: Some(img),
+            images: vec![img],
             control: ToolControl::Continue,
         }
     }

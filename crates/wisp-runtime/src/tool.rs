@@ -503,7 +503,7 @@ async fn run_runtime(
                             source.script.as_ref(),
                             &runtime,
                         ),
-                        image: None,
+                        images: Vec::new(),
                         control: wisp_tools::ToolControl::Continue,
                     };
                 }

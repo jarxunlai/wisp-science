@@ -71,6 +71,36 @@ fn budget_tool_result_with_limit(
     content: Content,
     budget: usize,
 ) -> Content {
+    if let Content::Parts(parts) = &content {
+        // Mixed MCP output must obey the same text budget as text-only tools.
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if budget == 0 || text.len() <= budget {
+            return content;
+        }
+        let Content::Text(bounded) =
+            budget_tool_result_with_limit(root, tool_name, Content::text(text), budget)
+        else {
+            unreachable!()
+        };
+        let mut bounded_parts = vec![Part::Text {
+            kind: "text".into(),
+            text: bounded,
+        }];
+        bounded_parts.extend(
+            parts
+                .iter()
+                .filter(|part| !matches!(part, Part::Text { .. }))
+                .cloned(),
+        );
+        return Content::Parts(bounded_parts);
+    }
     let Content::Text(text) = &content else {
         return content;
     };
@@ -572,42 +602,9 @@ async fn agent_loop_inner(
                     });
                 }
             }
-            let (content, tool_text, ok) = if let Some(img) = &result.image {
-                if ctx.supports_vision {
-                    // Fast path: the active model reads images natively, so
-                    // attach the picture directly to the tool result. The old
-                    // path round-tripped every view_image through a vision
-                    // describer first — one extra LLM call per image that, on
-                    // a reasoning vision model, averaged ~18s (p90 154s) per
-                    // look. The label text keeps the transcript readable and
-                    // `age_images` keeps old images bounded in context.
-                    (
-                        image_content(&img.label, &img.data_url),
-                        img.label.clone(),
-                        true,
-                    )
-                } else {
-                    match vision_provider {
-                        Some(vision) => match describe_image(vision, img, &name, &args).await {
-                            Ok(text) => (Content::text(text.clone()), text, true),
-                            Err(e) => {
-                                let text = format!("{name} error: vision model failed: {e}");
-                                (Content::text(text.clone()), text, false)
-                            }
-                        },
-                        None => {
-                            let text = format!("{name} error: no vision model is configured. Mark an API model as vision-capable in Settings -> Models and set it for image analysis.");
-                            (Content::text(text.clone()), text, false)
-                        }
-                    }
-                }
-            } else {
-                (
-                    Content::text(result.content.clone()),
-                    result.content.clone(),
-                    result.success,
-                )
-            };
+            let (content, tool_text, ok) =
+                model_tool_result(&result, ctx.supports_vision, vision_provider, &name, &args)
+                    .await;
             output.tool_result(&tools.event_name(&name, &args), ok, &tool_text, duration_ms);
             ctx.append_tool(
                 &tc.id,
@@ -842,6 +839,53 @@ async fn summarize_at_iteration_limit(
     result
 }
 
+/// Images supplement the result's text/structured facts, never replace them.
+/// A failed MCP result remains failed even when its attached images render.
+async fn model_tool_result(
+    result: &ToolResult,
+    supports_vision: bool,
+    vision_provider: Option<&dyn Provider>,
+    name: &str,
+    args: &serde_json::Value,
+) -> (Content, String, bool) {
+    if result.images.is_empty() {
+        return (
+            Content::text(result.content.clone()),
+            result.content.clone(),
+            result.success,
+        );
+    }
+    if supports_vision {
+        return (
+            native_image_content(&result.content, &result.images),
+            result.content.clone(),
+            result.success,
+        );
+    }
+    let mut text = result.content.clone();
+    let mut ok = result.success;
+    for image in &result.images {
+        match vision_provider {
+            Some(vision) => match describe_image(vision, image, name, args).await {
+                Ok(observation) => text.push_str(&format!(
+                    "\n\nVision-model observation for {} (not a tool assertion):\n{observation}",
+                    image.label,
+                )),
+                Err(error) => {
+                    ok = false;
+                    text.push_str(&format!("\n{name} error: vision model failed: {error}"));
+                }
+            },
+            None => {
+                ok = false;
+                text.push_str("\nImage content was not inspected: no vision model is configured. Mark an API model as vision-capable in Settings -> Models and set it for image analysis.");
+                break;
+            }
+        }
+    }
+    (Content::text(text.clone()), text, ok)
+}
+
 async fn describe_image(
     provider: &dyn Provider,
     img: &ImageData,
@@ -991,14 +1035,11 @@ fn hash_observation_part(hasher: &mut Sha256, part: &[u8]) {
 fn hash_tool_result(hasher: &mut Sha256, result: &ToolResult) {
     hasher.update([u8::from(result.success)]);
     hash_observation_part(hasher, result.content.as_bytes());
-    match &result.image {
-        Some(image) => {
-            hasher.update([1]);
-            hash_observation_part(hasher, image.mime.as_bytes());
-            hash_observation_part(hasher, image.label.as_bytes());
-            hash_observation_part(hasher, image.data_url.as_bytes());
-        }
-        None => hasher.update([0]),
+    hasher.update((result.images.len() as u64).to_le_bytes());
+    for image in &result.images {
+        hash_observation_part(hasher, image.mime.as_bytes());
+        hash_observation_part(hasher, image.label.as_bytes());
+        hash_observation_part(hasher, image.data_url.as_bytes());
     }
     hasher.update([match result.control {
         ToolControl::Continue => 0,
@@ -2178,6 +2219,81 @@ mod tests {
             data_url: "data:image/png;base64,aW1hZ2U=".into(),
             label: "Attached image: uploads/plot.png".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn rich_tool_result_preserves_text_all_images_and_failure() {
+        let mut result = ToolResult::fail("TERMINAL: true; planDigest: exact");
+        result.images = vec![test_image(), test_image()];
+        let fallback = RecordingProvider::new("fallback", "observation");
+        let (content, text, ok) = model_tool_result(
+            &result,
+            true,
+            Some(&fallback),
+            "preview",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(text, result.content);
+        let Content::Parts(parts) = content else {
+            panic!("expected multimodal content")
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], Part::Text { text, .. } if text.contains("exact")));
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| matches!(part, Part::Image { .. }))
+                .count(),
+            2
+        );
+        assert!(fallback.complete_messages.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rich_tool_result_no_vision_keeps_structured_facts_and_reports_omission() {
+        let mut result = ToolResult::ok("planDigest: exact");
+        result.images = vec![test_image()];
+        let (_, text, ok) =
+            model_tool_result(&result, false, None, "preview", &serde_json::json!({})).await;
+        assert!(!ok);
+        assert!(text.contains("planDigest: exact"));
+        assert!(text.contains("not inspected"));
+    }
+
+    #[test]
+    fn mixed_tool_text_is_budgeted_without_dropping_images() {
+        let root = std::env::temp_dir().join(format!("wisp-rich-budget-{}", uuid::Uuid::new_v4()));
+        let content = native_image_content(&"fact ".repeat(10_000), &[test_image(), test_image()]);
+        let bounded = budget_tool_result_with_limit(&root, "preview", content, 1024);
+        let Content::Parts(parts) = bounded else {
+            panic!("expected parts")
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(
+            matches!(&parts[0], Part::Text { text, .. } if text.len() < 2000 && text.contains("full output at"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rich_tool_result_fallback_supplements_text_and_does_not_clear_error() {
+        let mut result = ToolResult::fail("NEXT_ACTION: ask_user; planDigest: exact");
+        result.images = vec![test_image(), test_image()];
+        let fallback = RecordingProvider::new("fallback", "visible evidence");
+        let (_, text, ok) = model_tool_result(
+            &result,
+            false,
+            Some(&fallback),
+            "preview",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(!ok);
+        assert!(text.contains("planDigest: exact"));
+        assert_eq!(text.matches("visible evidence").count(), 2);
+        assert_eq!(fallback.complete_messages.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

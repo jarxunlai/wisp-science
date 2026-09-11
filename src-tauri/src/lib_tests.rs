@@ -525,7 +525,7 @@ fn image_helper_loads_supported_extension_for_model_input() {
     // Small images do not need the UI confirmation path; exercise the shared
     // loader directly through its image helper here.
     let result = wisp_tools::image::view_image(&uploads.join("plot.PNG").to_string_lossy());
-    let images = vec![result.image.unwrap()];
+    let images = result.images;
 
     assert_eq!(images.len(), 1);
     assert!(images[0].data_url.starts_with("data:image/png;base64,"));

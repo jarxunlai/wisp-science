@@ -4884,7 +4884,7 @@ async fn load_image_attachments(
             } else {
                 wisp_tools::image::view_image(&path.to_string_lossy())
             };
-            let mut image = result.image.ok_or(result.content)?;
+            let mut image = result.images.into_iter().next().ok_or(result.content)?;
             image.label = format!("Attached image: {attachment}. {}", image.label);
             Ok(image)
         })

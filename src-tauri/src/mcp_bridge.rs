@@ -317,10 +317,10 @@ impl BridgeServer {
                 else {
                     return Ok(tool_call_result("'tool_input' must be a JSON object", true));
                 };
-                match self.call_remote_tool(tool_name, tool_input).await {
-                    Ok(result) => result,
-                    Err(error) => (error.to_string(), true),
-                }
+                return match self.call_remote_tool(tool_name, tool_input).await {
+                    Ok(result) => Ok(result),
+                    Err(error) => Ok(tool_call_result(error.to_string(), true)),
+                };
             }
             "wisp_search_memory" => match self.search_memory_text(&args) {
                 Ok(s) => (s, false),
@@ -407,7 +407,7 @@ impl BridgeServer {
                     .await;
                 (result.content, !result.success)
             }
-            other => self.call_remote_tool(other, &args).await?,
+            other => return self.call_remote_tool(other, &args).await,
         };
         Ok(tool_call_result(text, is_error))
     }
@@ -655,7 +655,7 @@ impl BridgeServer {
         search_tool_catalog(self.route_tools(), args)
     }
 
-    async fn call_remote_tool(&mut self, name: &str, args: &Value) -> Result<(String, bool)> {
+    async fn call_remote_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
         self.ensure_remote_tools().await?;
         let route = self
             .routes
@@ -669,8 +669,8 @@ impl BridgeServer {
                 ..
             } => {
                 return Ok(match client.call(&remote_name, args).await {
-                    Ok(value) => (value.to_string(), false),
-                    Err(error) => (error.to_string(), true),
+                    Ok(value) => tool_call_result(value.to_string(), false),
+                    Err(error) => tool_call_result(error.to_string(), true),
                 });
             }
             Route::Custom {
@@ -679,9 +679,12 @@ impl BridgeServer {
                 ..
             } => (client, remote_name),
         };
-        Ok(match client.tool_call(&remote_name, args).await {
-            Ok(text) => (text, false),
-            Err(error) => (error.to_string(), true),
+        Ok(match client.tool_call_rich(&remote_name, args).await {
+            // Host-to-host transport: preserve the MCP envelope, including
+            // isError, images, structuredContent and App-only metadata. The
+            // receiving host is responsible for its own model projection.
+            Ok(result) => serde_json::to_value(result)?,
+            Err(error) => tool_call_result(error.to_string(), true),
         })
     }
 
@@ -1712,6 +1715,78 @@ mod tests {
             result["results"][0]["input_schema"]["properties"]["query"]["type"],
             "string"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_bridge_preserves_rich_results_for_direct_and_dispatch_calls() {
+        let expected = json!({
+            "content": [
+                {"type": "text", "text": "NEXT_ACTION: ask_user"},
+                {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="}
+            ],
+            "structuredContent": {"planDigest": "exact"},
+            "_meta": {"appOnly": "not-model-context"},
+            "isError": true
+        });
+        let response = expected.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let response = response.clone();
+                async move {
+                    let result = if request["method"] == "tools/call" {
+                        response
+                    } else {
+                        json!({"protocolVersion": "2024-11-05", "capabilities": {},
+                               "serverInfo": {"name": "fixture", "version": "1"}})
+                    };
+                    axum::Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let service = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = Arc::new(
+            wisp_mcp::McpClient::connect_http_with_proxy(&url, &[], "none")
+                .await
+                .unwrap(),
+        );
+        let base = std::env::temp_dir().join(format!("wisp_bridge_rich_{}", uuid::Uuid::new_v4()));
+        let project_root = base.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let mut server = BridgeServer::new(BridgeConfig {
+            app_data: base.join("app-data"),
+            project_root,
+            resource_root: None,
+            project_id: "rich-test".into(),
+            frame_id: None,
+            allowed_tools: None,
+        })
+        .await
+        .unwrap();
+        server.bundled_bio_tools_loaded = true;
+        server.custom_mcp_tools_loaded = true;
+        server.routes.insert(
+            "fixture_preview".into(),
+            Route::Custom {
+                connector_id: "fixture".into(),
+                client,
+                remote_name: "preview".into(),
+                description: String::new(),
+                input_schema: json!({"type": "object"}),
+            },
+        );
+        for params in [
+            json!({"name": "fixture_preview", "arguments": {}}),
+            json!({"name": "wisp_use_tool", "arguments": {"tool_name": "fixture_preview", "tool_input": {}}}),
+        ] {
+            assert_eq!(server.tools_call(params).await.unwrap(), expected);
+        }
+        drop(server);
+        service.abort();
+        let _ = service.await;
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]

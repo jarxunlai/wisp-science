@@ -6,6 +6,7 @@
 //! search/dispatch pair instead of sending the full catalog on every turn.
 
 pub mod client;
+pub mod result;
 pub mod tool;
 
 pub use client::{McpCallResult, McpClient, RemoteTool};

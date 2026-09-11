@@ -6,6 +6,20 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 use wisp_mcp::McpClient;
+use wisp_tools::{Registry, ToolEnv, ToolEvent};
+
+struct TestEnv;
+
+#[async_trait::async_trait]
+impl ToolEnv for TestEnv {
+    fn project_root(&self) -> &std::path::Path {
+        std::path::Path::new(".")
+    }
+    async fn confirm(&self, _: &str) -> bool {
+        true
+    }
+    async fn emit(&self, _: ToolEvent) {}
+}
 
 const ECHO_ARG: &str = "--fake-echo-mcp";
 
@@ -73,13 +87,26 @@ fn fake_echo_server() -> ExitCode {
                 if delay > 0 {
                     std::thread::sleep(Duration::from_millis(delay));
                 }
-                json!({
-                    "content": [{ "type": "text", "text": "ok" }],
-                    "structuredContent": {
-                        "token": arguments.get("token").cloned().unwrap_or(Value::Null)
-                    },
-                    "isError": false
-                })
+                if arguments.get("rich") == Some(&json!(true)) {
+                    json!({
+                        "content": [
+                            {"type": "text", "text": "TERMINAL: true\nNEXT_ACTION: ask_user"},
+                            {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="},
+                            {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="}
+                        ],
+                        "structuredContent": {"planDigest": "exact-token"},
+                        "_meta": {"appOnly": "private-selection"},
+                        "isError": true
+                    })
+                } else {
+                    json!({
+                        "content": [{ "type": "text", "text": "ok" }],
+                        "structuredContent": {
+                            "token": arguments.get("token").cloned().unwrap_or(Value::Null)
+                        },
+                        "isError": false
+                    })
+                }
             }
             _ => json!({}),
         };
@@ -92,8 +119,41 @@ fn fake_echo_server() -> ExitCode {
 }
 
 async fn run_stdio_transport_regressions() -> Result<(), String> {
+    deferred_tool_retains_rich_result().await?;
     concurrent_stdio_calls_keep_matching_ids().await?;
     cancelled_isolated_call_leaves_connection_usable().await
+}
+
+async fn deferred_tool_retains_rich_result() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let client = std::sync::Arc::new(
+        McpClient::launch(&executable.to_string_lossy(), &[ECHO_ARG.into()])
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    let remote = client
+        .tools_list()
+        .await
+        .map_err(|e| e.to_string())?
+        .remove(0);
+    let mut registry = Registry::builtins();
+    registry.add(Box::new(wisp_mcp::McpTool::new(remote, client.clone())));
+    let result = registry
+        .run(
+            "use_mcp_tool",
+            &json!({
+                "tool_name": "echo", "tool_input": {"token": "rich", "rich": true}
+            }),
+            &TestEnv,
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.images.len(), 2);
+    assert!(result.content.contains("exact-token"));
+    assert!(result.content.contains("NEXT_ACTION: ask_user"));
+    assert!(!result.content.contains("private-selection"));
+    drop(registry);
+    client.shutdown().await.map_err(|e| e.to_string())
 }
 
 async fn concurrent_stdio_calls_keep_matching_ids() -> Result<(), String> {

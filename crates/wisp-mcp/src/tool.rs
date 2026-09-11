@@ -465,11 +465,11 @@ impl Tool for McpTool {
     async fn run(&self, args: &Value, env: &dyn ToolEnv) -> ToolResult {
         match self.client.tool_call_rich(&self.name, args).await {
             Ok(result) => {
-                let mut content = result.text_content();
+                let mut output = crate::result::model_result(&result);
                 let artifacts = materialize_html_resources(&result, env.project_root(), env).await;
                 if !artifacts.is_empty() {
-                    content.push_str("\n\nGenerated artifacts: ");
-                    content.push_str(
+                    output.content.push_str("\n\nGenerated artifacts: ");
+                    output.content.push_str(
                         &artifacts
                             .iter()
                             .map(|path| path.to_string_lossy())
@@ -480,14 +480,7 @@ impl Tool for McpTool {
                 if let Some(uri) = self.remote.ui_resource_uri() {
                     self.emit_mcp_app(uri, args, &result, env).await;
                 }
-                if content.trim().is_empty() {
-                    content = "(no output)".into();
-                }
-                if result.is_error {
-                    ToolResult::fail(content)
-                } else {
-                    ToolResult::ok(content)
-                }
+                output
             }
             Err(e) => ToolResult::fail(format!("mcp {name} error: {e}", name = self.name)),
         }

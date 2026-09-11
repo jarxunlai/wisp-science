@@ -76,6 +76,40 @@ rather than its entire workspace.
 
 ## Safety boundary
 
+### Tool-result fidelity
+
+Plugin results are not text-only. The native agent receives MCP text and
+`structuredContent`, plus all supported model-visible image blocks. Images
+supplement text rather than replacing selectors, plan digests, terminal
+outcomes, or error flags. App-only `_meta` is not model context. Explicit
+content `annotations.audience` that omit `assistant` stay out of the native
+agent's projection. An image does not make a failed result successful.
+
+The native image projection accepts base64 PNG/JPEG/GIF/WebP, at most eight
+images, 5 MiB decoded per image, and 20 MiB decoded per result. This validates
+MIME/base64/size, not pixel-level file integrity. Unsupported or omitted content
+produces an explicit notice; it is never silently represented as inspected.
+Resource links are reported without automatically fetching them; embedded
+resource text is retained and binary blobs are not dumped into model text.
+Text in mixed image results uses the same context budget and spill-to-file
+path as text-only output. A configured vision model may describe images for a
+text-only primary model; those observations supplement the original result
+and are identified as model observations, not server facts.
+
+The external-agent MCP bridge preserves the remote CallToolResult envelope
+for both direct calls and `wisp_use_tool`, including `isError`,
+`structuredContent`, media and `_meta`. The receiving host must apply its
+own model-visibility rules. This does not add Apps rendering to a headless
+external agent or equate model-visible images with user-visible App previews.
+
+Regression gates: `cargo test -p wisp-mcp -p wisp-core --offline`, the
+`custom_bridge_preserves_rich_results_for_direct_and_dispatch_calls` Tauri
+test, and the full workspace suite. MCP stdio fixtures use a local test
+executable; the bridge test uses an ephemeral loopback HTTP fixture, not a
+real plugin, user Library, external API, or credential.
+
+### Isolation and execution policy
+
 - ZIP extraction rejects traversal, symbolic links, duplicate paths, oversized
   files, excessive file counts, and expansion beyond the configured limit.
 - Install does not run `npm install`, `postinstall`, shell scripts, or any other
