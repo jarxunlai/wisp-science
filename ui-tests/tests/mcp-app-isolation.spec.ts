@@ -44,6 +44,9 @@ async function start(page: Page) {
   await page.locator(".composer-inner textarea").first().fill("open isolated app");
   await page.getByRole("button", { name:"Send", exact:true }).click();
   await expect.poll(() => page.evaluate(() => (window as any).__skillInvokeLog?.some((c: any) => c.cmd === "send_message"))).toBe(true);
+  // The mock completes the opening turn asynchronously. In an optimized build
+  // its later Done event could otherwise clear the App approval injected below.
+  await expect(page.getByText("Hello from mock wisp-science.", { exact:true })).toBeVisible();
   return page.evaluate(() => {
     const args = (window as any).__skillInvokeLog.filter((c: any) => c.cmd === "send_message").at(-1).args;
     return String(args instanceof Map ? args.get("sessionId") : args.sessionId);
