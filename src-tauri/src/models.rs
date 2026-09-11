@@ -67,6 +67,10 @@ pub struct ModelProfile {
     /// to the Scientific Illustrator's raster image-generation tool.
     #[serde(default)]
     pub use_for_image_generation: bool,
+    /// Persistent image role, separate from the one currently assigned image
+    /// profile. Custom IDs must not turn into chat models when deselected.
+    #[serde(default)]
+    pub image_generation_capable: bool,
     /// OpenAI image size (`auto`, `1024x1024`, …). Empty means the tool default.
     #[serde(default)]
     pub image_size: String,
@@ -724,6 +728,7 @@ async fn ensure(store: &wisp_store::Store) -> Vec<ModelProfile> {
         supports_vision: false,
         use_for_vision: false,
         use_for_image_generation: false,
+        image_generation_capable: false,
         image_size: String::new(),
         image_quality: String::new(),
         image_aspect_ratio: String::new(),
@@ -891,15 +896,15 @@ pub async fn active_config(store: &wisp_store::Store) -> (String, String, String
 }
 
 pub(crate) const IMAGE_GENERATION_UNSUPPORTED: &str =
-    "Image generation currently supports OpenAI gpt-image-2 and xAI grok-imagine-image-2.0.";
+    "Image generation requires an OpenAI-compatible Images API protocol and a non-empty model ID.";
 
 pub(crate) fn model_id_tail(model: &str) -> &str {
     let model = model.trim();
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// Raster image-generation model IDs. Gateway `vendor/model` ids match on the
-/// last path segment. Exact IDs only.
+/// Known IDs used only for backwards-compatible automatic classification.
+/// This is a hint, not an allowlist: explicit image profiles accept custom IDs.
 pub(crate) fn is_image_generation_model(model: &str) -> bool {
     let tail = model_id_tail(model);
     tail.eq_ignore_ascii_case("gpt-image-2") || tail.eq_ignore_ascii_case("grok-imagine-image-2.0")
@@ -926,8 +931,22 @@ pub(crate) fn is_video_generation_model(model: &str) -> bool {
         || tail.eq_ignore_ascii_case("grok-imagine-video-1.5-preview")
 }
 
+fn profile_is_image_model(profile: &ModelProfile) -> bool {
+    profile.image_generation_capable
+        || profile.use_for_image_generation
+        || is_image_generation_model(&profile.model)
+}
+
+fn normalize_image_role(profile: &mut ModelProfile, existing: Option<&ModelProfile>) {
+    profile.image_generation_capable = profile.use_for_image_generation
+        || is_image_generation_model(&profile.model)
+        || existing.is_some_and(|old| {
+            old.model.trim() == profile.model.trim() && profile_is_image_model(old)
+        });
+}
+
 fn normalize_image_options(profile: &mut ModelProfile) -> Result<(), String> {
-    if !is_image_generation_model(&profile.model) {
+    if !profile_is_image_model(profile) {
         profile.image_size.clear();
         profile.image_quality.clear();
         profile.image_aspect_ratio.clear();
@@ -987,7 +1006,7 @@ pub(crate) fn supports_image_generation(provider: &str, model: &str) -> bool {
     matches!(
         provider.trim(),
         "openai" | "openai_compatible" | "openai_responses" | "openai-responses" | "responses"
-    ) && is_image_generation_model(model)
+    ) && !model.trim().is_empty()
 }
 
 /// Out-of-range or unknown video options are dropped back to the tool
@@ -1022,7 +1041,7 @@ pub(crate) fn supports_video_generation(provider: &str, model: &str) -> bool {
 }
 
 fn is_chat_model(p: &ModelProfile) -> bool {
-    !is_image_generation_model(&p.model) && !is_video_generation_model(&p.model)
+    !profile_is_image_model(p) && !is_video_generation_model(&p.model)
 }
 
 fn can_describe_images(p: &ModelProfile) -> bool {
@@ -1030,7 +1049,7 @@ fn can_describe_images(p: &ModelProfile) -> bool {
 }
 
 fn can_generate_images(p: &ModelProfile) -> bool {
-    supports_image_generation(&p.provider, &p.model)
+    profile_is_image_model(p) && supports_image_generation(&p.provider, &p.model)
 }
 
 fn can_generate_videos(p: &ModelProfile) -> bool {
@@ -1292,6 +1311,9 @@ fn effective_context_window(profile: &ModelProfile) -> u64 {
 /// Clamp `context_window`/`max_tokens` to the model's catalog ceilings.
 /// `max_tokens = 0` means "unset" and is left alone.
 fn clamp_to_catalog(profile: &mut ModelProfile) {
+    if !is_chat_model(profile) {
+        return;
+    }
     if let Some(entry) =
         crate::model_catalog::lookup(&profile.provider, &profile.api_url, &profile.model)
     {
@@ -1398,6 +1420,7 @@ async fn decorated(store: &wisp_store::Store) -> Vec<ModelProfile> {
     profiles
         .into_iter()
         .map(|mut p| {
+            p.image_generation_capable = profile_is_image_model(&p);
             p.has_api_key = !key_for(&p.id).is_empty();
             p.active = p.id == id;
             p.use_for_vision = vision.as_deref() == Some(p.id.as_str());
@@ -1531,6 +1554,9 @@ pub async fn save_model(
     profile.use_for_vision = assign_vision;
     profile.use_for_image_generation = assign_image_generation;
     profile.use_for_video_generation = assign_video_generation;
+    if assign_image_generation && assign_video_generation {
+        return Err("Choose either image or video generation for a model profile.".into());
+    }
     let mut profiles = ensure(&state.store).await;
     if profile.model.trim().is_empty() {
         return Err("Model is required.".into());
@@ -1544,6 +1570,8 @@ pub async fn save_model(
     profile.user_agent = wisp_llm::provider::normalize_user_agent(&profile.user_agent)?;
     profile.session_header_name =
         wisp_llm::provider::normalize_session_header_name(&profile.session_header_name)?;
+    let existing = profiles.iter().find(|old| old.id == profile.id);
+    normalize_image_role(&mut profile, existing);
     if assign_vision && !can_describe_images(&profile) {
         return Err("Image analysis requires an API model marked as vision-capable.".into());
     }
@@ -1854,6 +1882,7 @@ mod tests {
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -2318,6 +2347,15 @@ mod tests {
         assert!(!can_generate_images(&profile));
         profile.model = "grok-imagine-image".into();
         assert!(!can_generate_images(&profile));
+        profile.use_for_image_generation = true;
+        for model in ["gpt-image-2.5", "vendor/custom-raster-v3", "dall-e-3"] {
+            profile.model = model.into();
+            assert!(can_generate_images(&profile), "{model}");
+            assert!(!is_chat_model(&profile));
+        }
+        profile.provider = "anthropic".into();
+        assert!(!can_generate_images(&profile));
+        assert!(!supports_image_generation("openai", "  "));
         assert!(!is_chat_model(&test_profile(
             "image",
             "image",
@@ -2350,7 +2388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_generation_requires_an_explicit_gpt_image_2_assignment() {
+    async fn image_generation_requires_an_explicit_assignment() {
         let tmp =
             std::env::temp_dir().join(format!("wisp_image_gen_{}.sqlite", uuid::Uuid::new_v4()));
         let store = wisp_store::Store::open(&tmp).await.unwrap();
@@ -2386,6 +2424,58 @@ mod tests {
             ["chat"]
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn custom_image_role_survives_deselection_reload_and_retains_options() {
+        let tmp =
+            std::env::temp_dir().join(format!("wisp_custom_image_{}.sqlite", uuid::Uuid::new_v4()));
+        let store = wisp_store::Store::open(&tmp).await.unwrap();
+        let chat = test_profile("chat", "chat", "gpt-5.5");
+        let mut image = test_profile("image", "image", "gpt-image-2.5");
+        image.use_for_image_generation = true;
+        image.image_size = "1536x1024".into();
+        image.image_quality = "high".into();
+        normalize_image_role(&mut image, None);
+        normalize_image_options(&mut image).unwrap();
+        assert!(image.image_generation_capable);
+        save_raw(&store, &[chat.clone(), image.clone()])
+            .await
+            .unwrap();
+        store
+            .set_setting(IMAGE_GENERATION_KEY, "image")
+            .await
+            .unwrap();
+        let (_, model, _, options) = image_generation_config(&store).await.unwrap();
+        assert_eq!(model, "gpt-image-2.5");
+        assert_eq!(options.size, "1536x1024");
+        assert_eq!(options.quality, "high");
+        store.set_setting(IMAGE_GENERATION_KEY, "").await.unwrap();
+        let mut deselected = decorated(&store)
+            .await
+            .into_iter()
+            .find(|p| p.id == "image")
+            .unwrap();
+        assert!(!deselected.use_for_image_generation);
+        assert!(deselected.image_generation_capable);
+        assert!(!is_chat_model(&deselected));
+        normalize_image_role(&mut deselected, Some(&image));
+        save_raw(&store, &[chat, deselected.clone()]).await.unwrap();
+        assert_eq!(
+            delegation_profiles(&store)
+                .await
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["chat"]
+        );
+        assert!(image_generation_config(&store).await.is_none());
+        deselected.model = "renamed-chat-id".into();
+        normalize_image_role(&mut deselected, Some(&image));
+        assert!(!deselected.image_generation_capable);
+        assert!(is_chat_model(&deselected));
+        drop(store);
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]

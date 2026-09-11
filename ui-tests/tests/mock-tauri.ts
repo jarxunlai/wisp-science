@@ -3858,6 +3858,8 @@ export function tauriMock(fixtures?: { xlsxBase64?: string; pptxBase64?: string;
               ...profile,
               use_for_vision: useForVision,
               use_for_image_generation: useForImageGeneration,
+              image_generation_capable: useForImageGeneration
+                || (m.model === profile.model && Boolean(m.image_generation_capable)),
               use_for_video_generation: useForVideoGeneration,
             } : {
               ...m,
@@ -4719,6 +4721,9 @@ export function tauriMock(fixtures?: { xlsxBase64?: string; pptxBase64?: string;
           case "validate_settings": {
             const validationSettings = plain(arg("settings") ?? {});
             const validatedModel = String(validationSettings.model ?? "");
+            if (arg("useForImageGeneration")) {
+              return `Validated ${validationSettings.provider} with ${validatedModel}`;
+            }
             if (validatedModel === "gpt-image-2") {
               return "Validated openai_responses with gpt-image-2";
             }

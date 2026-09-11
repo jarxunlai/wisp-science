@@ -1189,6 +1189,7 @@ mod session_context_window_tests {
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -2809,6 +2810,8 @@ pub struct ModelProfile {
     #[serde(default)]
     pub use_for_image_generation: bool,
     #[serde(default)]
+    pub image_generation_capable: bool,
+    #[serde(default)]
     pub image_size: String,
     #[serde(default)]
     pub image_quality: String,
@@ -2826,9 +2829,8 @@ pub struct ModelProfile {
     pub video_resolution: Option<String>,
 }
 
-/// Raster image-generation model IDs. Gateway `vendor/model` ids match on the
-/// last path segment. Exact IDs only — a shorter family id must not absorb a
-/// longer sibling.
+/// Known image IDs used for automatic hints, never as an acceptance allowlist.
+/// Explicit image capability also supports custom IDs; catalog matching stays exact.
 pub fn is_image_generation_model(model: &str) -> bool {
     let model = model.trim();
     let tail = model.rsplit('/').next().unwrap_or(model);
@@ -2869,7 +2871,10 @@ pub const VIDEO_DURATION_DEFAULT_SECS: u32 = 5;
 
 impl ModelProfile {
     pub fn is_chat_model(&self) -> bool {
-        !is_image_generation_model(&self.model) && !is_video_generation_model(&self.model)
+        !(self.image_generation_capable
+            || self.use_for_image_generation
+            || is_image_generation_model(&self.model))
+            && !is_video_generation_model(&self.model)
     }
 }
 
@@ -3331,6 +3336,7 @@ mod image_generation_model_tests {
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -3340,6 +3346,23 @@ mod image_generation_model_tests {
             video_aspect_ratio: None,
             video_resolution: None,
         }
+    }
+
+    #[test]
+    fn custom_image_capability_does_not_depend_on_the_current_assignment() {
+        let mut p = profile("gpt-image-2.5");
+        assert!(p.is_chat_model());
+        p.use_for_image_generation = true;
+        assert!(!p.is_chat_model());
+        p.image_generation_capable = true;
+        p.use_for_image_generation = false;
+        assert!(!p.is_chat_model());
+        let form = super::ModelForm {
+            model: p.model,
+            image_generation_capable: true,
+            ..Default::default()
+        };
+        assert!(form.is_image_model());
     }
 
     #[test]
@@ -3388,6 +3411,7 @@ mod video_generation_model_tests {
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -3459,6 +3483,7 @@ pub struct ModelForm {
     pub supports_vision: bool,
     pub use_for_vision: bool,
     pub use_for_image_generation: bool,
+    pub image_generation_capable: bool,
     pub image_size: String,
     pub image_quality: String,
     pub image_aspect_ratio: String,
@@ -3470,6 +3495,14 @@ pub struct ModelForm {
     /// Used only when adding a provider (`id` is `None`): one row per model
     /// that should be created with the shared API URL and key.
     pub entries: Vec<ModelFormEntry>,
+}
+
+impl ModelForm {
+    pub fn is_image_model(&self) -> bool {
+        self.image_generation_capable
+            || self.use_for_image_generation
+            || is_image_generation_model(&self.model)
+    }
 }
 
 /// `model_catalog_lookup` projection of one baked catalog entry.

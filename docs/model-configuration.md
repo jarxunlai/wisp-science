@@ -161,12 +161,19 @@ the switch is analyzed through the assigned vision model. Without an assigned
 vision model, Wisp rejects that new image before starting the main model turn.
 
 Image generation is a separate model role. Create an OpenAI-compatible profile
-with model ID `gpt-image-2` or `grok-imagine-image-2.0`, then enable **Use for
-image generation**. The edit form for those models hides chat-only fields
+with the exact model ID supplied by your provider, then enable **Use for
+image generation**. Custom IDs and gateway aliases (for example `gpt-image-2.5`
+or `vendor/custom-image-v3`) are accepted without a Wisp model-name allowlist;
+availability and supported parameters remain the provider's responsibility.
+Known model names are only auto-selection hints, not acceptance gates.
+The edit form for image profiles hides chat-only fields
 (max output tokens, context window, reasoning effort, and vision) and shows
-image defaults instead: size and quality for `gpt-image-2`, or aspect ratio,
+image defaults instead: size and quality for OpenAI-compatible models, or aspect ratio,
 resolution, and quality for `grok-imagine-image-2.0`. `generate_image` uses
-those defaults when a request does not specify size or quality. For xAI, use
+those defaults when a request does not specify size or quality. Custom IDs use
+a minimal Images API request by default; GPT-Image-specific `output_format`
+and automatic size/quality values are not forced onto unknown models.
+For xAI, use
 Base URL `https://api.x.ai` and the OpenAI Chat Completions protocol. The built-in **Scientific Illustrator** calls the
 provider's Image API (`/images/generations`) and saves a PNG under `figures/`
 when that role is assigned and PNG or image-model generation is requested. An
@@ -185,6 +192,21 @@ PNG if present. Otherwise it uses the same SVG -> PNG preview -> SVG
 correction workflow and delivers SVG under `figures/`. Image-only profiles do
 not appear in chat, Reviewer, specialist, delegation, or side-chat model
 pickers.
+
+The persistent `image_generation_capable` role is separate from the currently
+assigned image profile: deselecting an image profile does not accidentally make
+it a chat model. Renaming a profile to a different model resets the old role
+unless image generation is explicitly selected for the new ID. Existing
+profiles without the new marker retain backwards-compatible known-name and
+assignment hints. Chat catalog limits still use exact model-ID matching.
+
+The **Validate** action sends the form's image role to the backend and performs
+authenticated `GET /models/{id}` (falling back to `GET /models` when the
+individual lookup is unavailable). It never probes image-only models with
+`/chat/completions` or `/responses`, and does not generate a billable image.
+Successful metadata validation confirms model visibility, not successful image
+generation. A gateway without compatible model metadata may still fail this
+non-generating check; Wisp does not hide that failure or fabricate success.
 
 An image-generation assignment does not also provide image analysis.
 These image models may consume an input image for editing, but their Image API
