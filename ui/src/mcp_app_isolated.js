@@ -19,10 +19,10 @@ const host = () => hostPromise ||= invoke("mcp_app_host_info").then((info) => {
 const current = (instance) => active === instance && !instance.closed && instance.target?.isConnected;
 const text = () => document.documentElement.lang.startsWith("zh") ? {
   hint:"此 App 在独立视图中运行；切走将销毁，切回重建。未提交的勾选、分页和编辑可能丢失。",
-  retry:"重新加载 App", loading:"正在创建隔离视图…", error:"App 隔离视图不可用：",
+  retry:"重新加载 App", reconnect:"重新连接插件", confirm:"重新连接会终止本对话的插件连接。未完成操作可能已产生外部修改，不会自动重做。是否继续？", loading:"正在连接插件并创建隔离视图…", error:"App 隔离视图不可用：",
 } : {
   hint:"Isolated App: leaving destroys this view. Reopening restores saved results, not unsubmitted selections, pages or edits.",
-  retry:"Reload App", loading:"Creating isolated view…", error:"Isolated App unavailable: ",
+  retry:"Reload App", reconnect:"Reconnect plugins", confirm:"This restarts this conversation’s plugin connections. Unfinished operations may have external effects and will not be replayed. Continue?", loading:"Connecting plugins and creating isolated view…", error:"Isolated App unavailable: ",
 };
 
 const visibleElement = (el) => {
@@ -159,7 +159,17 @@ export function mountIsolatedApp(id, elId, payloadJson) {
   const hint = document.createElement("span"); hint.textContent = text().hint;
   const reload = document.createElement("button"); reload.type = "button"; reload.textContent = text().retry;
   reload.addEventListener("click", () => mountIsolatedApp(id, elId, instance.source));
-  controls.append(hint, reload);
+  const reconnect = document.createElement("button"); reconnect.type = "button"; reconnect.textContent = text().reconnect;
+  reconnect.addEventListener("click", async () => {
+    if (!window.confirm(text().confirm)) return;
+    reconnect.disabled = true;
+    try {
+      await retire(instance, "replace");
+      await invoke("restart_session_mcp", {instanceId:id, confirmOutcomeUnknown:true});
+      mountIsolatedApp(id, elId, instance.source);
+    } catch (error) { reconnect.disabled = false; instance.status.textContent = String(error); }
+  });
+  controls.append(hint, reload, reconnect);
   const target = document.createElement("div"); target.className = "mcp-app-native-content";
   const status = document.createElement("div"); status.className = "mcp-app-native-status"; status.textContent = text().loading;
   target.append(status);
@@ -173,6 +183,14 @@ export function mountIsolatedApp(id, elId, payloadJson) {
     try {
       const info = await host();
       if (!current(instance)) return;
+      if (instance.payload?._wispMcpBinding) {
+        const restored = await invoke("prepare_mcp_app", {instanceId:id});
+        if (!current(instance)) return;
+        if (restored) instance.payload = restored;
+        if (instance.payload._wispHistoricalResult) hint.textContent += document.documentElement.lang.startsWith("zh")
+          ? " 已恢复连接；显示的是历史结果，未完成操作不会重做，写操作前请重新检查或生成计划。"
+          : " Connection restored; results are historical. Interrupted operations are not replayed; review or re-plan before writing.";
+      }
       const b = bounds(instance);
       const handle = await invoke("open_mcp_app_child", {instanceId:id, payload:instance.payload,
         ownerEpoch:info.ownerEpoch, mountSerial:instance.serial, bounds:b, hostContext:context(instance, b)});

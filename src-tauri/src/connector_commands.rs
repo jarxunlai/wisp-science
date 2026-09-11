@@ -67,6 +67,9 @@ pub(super) async fn update_mcp_connection(
     if removed_oauth {
         crate::mcp_oauth::forget(&connection_id);
     }
+    crate::mcp_connections::host()
+        .invalidate_connector(&connection_id)
+        .await;
     clear_idle_agents(&state).await;
     Ok(())
 }

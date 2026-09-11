@@ -5042,3 +5042,11 @@ pub struct NetworkSettings {
 
 mod research_journey;
 pub use research_journey::*;
+/// Host-authored logical binding. Never accepts an iframe-supplied connector.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpAppBinding {
+    pub version: u32,
+    pub project_id: String,
+    pub frame_id: String,
+    pub connector_id: String,
+}

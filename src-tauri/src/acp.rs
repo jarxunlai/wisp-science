@@ -554,7 +554,14 @@ pub(crate) fn project_mcp_server(
 ) -> Result<McpServer, String> {
     let (command, args) = acp_bridge_launch(app_data, project, frame_id, allowed_tools)?;
     Ok(McpServer::Stdio(
-        McpServerStdio::new("wisp-science", PathBuf::from(command)).args(args),
+        McpServerStdio::new("wisp-science", PathBuf::from(command))
+            .args(args)
+            .env(crate::mcp_broker::launch_env(
+                app_data,
+                project,
+                frame_id,
+                allowed_tools,
+            )?),
     ))
 }
 
@@ -1780,6 +1787,7 @@ pub(crate) async fn set_acp_session_mode(
 }
 
 pub(crate) async fn cancel_frame(state: &AppState, frame_id: &str) {
+    crate::mcp_broker::cancel_frame(frame_id);
     if let Some(runtime) = state.acp_sessions.lock().await.remove(frame_id) {
         let _ = runtime.handle.cancel(runtime.session_id.clone());
         cancel_pending_permissions(state, frame_id, &runtime).await;
@@ -1804,6 +1812,7 @@ pub(crate) async fn cancel_frame(state: &AppState, frame_id: &str) {
 }
 
 pub(crate) async fn close_frame(state: &AppState, frame_id: &str) {
+    crate::mcp_broker::cancel_frame(frame_id);
     if let Some(runtime) = state.acp_sessions.lock().await.remove(frame_id) {
         let _ = runtime
             .handle

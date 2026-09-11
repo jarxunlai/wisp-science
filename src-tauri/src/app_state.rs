@@ -7,7 +7,7 @@
 
 use super::*;
 
-/// Per-session runtime: one agent (with its own MCP clients), one cancel flag,
+/// Per-session runtime: one agent (with Host-managed MCP handles), one cancel flag,
 /// and the persisted-seq cursor. Python processes live in the project-scoped
 /// `RuntimeManager`, so rebuilding or deleting a conversation preserves them.
 /// Keyed by frame id in `AppState.sessions`, so different conversations run
@@ -275,8 +275,8 @@ pub(crate) struct ActiveProject {
 /// Host-side `serverTools` binding for one live MCP App instance. Registered
 /// when an `mcp_app` presentation flows to the UI and revoked on teardown or
 /// session delete; the `server` handle keeps only a `Weak` reference to the
-/// MCP client, so an agent rebuild or connector restart naturally makes the
-/// instance stale instead of pinning the server process.
+/// MCP client. Host ownership preserves it across Agent rebuilds; connection
+/// and view generations revoke stale callbacks without making the view a process owner.
 #[derive(Clone)]
 pub(crate) struct McpAppToolBridge {
     pub(crate) generation: u64,
@@ -301,7 +301,9 @@ pub(crate) struct McpAppBridges {
 impl McpAppBridges {
     pub(crate) fn register(&self, instance_id: String, mut bridge: McpAppToolBridge) {
         bridge.generation = self.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.bridges.lock().unwrap().insert(instance_id, bridge);
+        if let Some(old) = self.bridges.lock().unwrap().insert(instance_id, bridge) {
+            old.limiter.closed.store(true, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn close_generation(&self, instance_id: &str, generation: Option<u64>) -> bool {
@@ -310,7 +312,9 @@ impl McpAppBridges {
             .get(instance_id)
             .is_some_and(|b| Some(b.generation) == generation)
         {
-            bridges.remove(instance_id);
+            if let Some(old) = bridges.remove(instance_id) {
+                old.limiter.closed.store(true, Ordering::SeqCst);
+            }
             return true;
         }
         false
@@ -321,19 +325,48 @@ impl McpAppBridges {
     }
 
     pub(crate) fn close(&self, instance_id: &str) -> bool {
-        self.bridges.lock().unwrap().remove(instance_id).is_some()
-    }
-
-    pub(crate) fn remove_for_frame(&self, frame_id: &str) {
         self.bridges
             .lock()
             .unwrap()
-            .retain(|_, bridge| bridge.frame_id != frame_id);
+            .remove(instance_id)
+            .is_some_and(|old| {
+                old.limiter.closed.store(true, Ordering::SeqCst);
+                true
+            })
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        for bridge in self.bridges.lock().unwrap().values() {
+            bridge.limiter.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(crate) fn cancel_for_frame(&self, frame_id: &str) {
+        for bridge in self
+            .bridges
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.frame_id == frame_id)
+        {
+            bridge.limiter.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(crate) fn remove_for_frame(&self, frame_id: &str) {
+        self.bridges.lock().unwrap().retain(|_, bridge| {
+            if bridge.frame_id == frame_id {
+                bridge.limiter.closed.store(true, Ordering::SeqCst);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct McpAppCallLimiter {
+    pub(crate) cancel_epoch: std::sync::atomic::AtomicU64,
+    pub(crate) closed: AtomicBool,
     max_concurrent: usize,
     max_per_window: usize,
     window: std::time::Duration,
@@ -355,6 +388,14 @@ impl Drop for McpAppCallPermit {
 }
 
 impl McpAppCallLimiter {
+    pub(crate) fn was_cancelled(&self, epoch: u64) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.cancel_epoch.load(Ordering::SeqCst) != epoch
+    }
+    pub(crate) async fn cancelled(&self, epoch: u64) {
+        while !self.was_cancelled(epoch) {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
     pub(crate) fn new() -> Arc<Self> {
         Self::with_limits(
             MCP_APP_MAX_CONCURRENT_CALLS,
@@ -369,6 +410,8 @@ impl McpAppCallLimiter {
         window: std::time::Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
+            cancel_epoch: std::sync::atomic::AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             max_concurrent,
             max_per_window,
             window,

@@ -1060,17 +1060,36 @@ async fn ssh_launch_failure_stops_after_the_first_attempt() {
         .set_session_execution_context_enabled("f", "ssh:gpu", true)
         .await
         .unwrap();
-    let runner = Arc::new(ScriptedRunRunner::new(vec![
-        ok_output("__WISP_PREPARED__\n"),
-        ok_output(""),
-        Err("temporary SSH disconnect".into()),
-        // Post-failure reattach probe: nothing was submitted remotely, so the
-        // original launch error must surface and the Run must fail.
-        ok_output("__WISP_PREPARED__\n"),
-    ]));
-    runner
-        .synthesize_launch_ack
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Route by operation, not timing: a background transfer-progress poll may
+    // race the immediately-ready SCP future. It must not consume the scripted
+    // upload response and shift the launch failure into the staging phase.
+    struct LaunchFailureRunner {
+        commands: StdMutex<Vec<RunCommand>>,
+    }
+    #[async_trait::async_trait]
+    impl RunCommandRunner for LaunchFailureRunner {
+        async fn run(
+            &self,
+            command: RunCommand,
+            _timeout: Duration,
+        ) -> Result<RunCommandOutput, String> {
+            let result = if command.program == "scp" {
+                ok_output("")
+            } else {
+                match command.script.as_str() {
+                    "prepare SSH Run" => ok_output("__WISP_PREPARED__\n"),
+                    "poll SSH input progress" => ok_output(""),
+                    "launch SSH Run" => Err("temporary SSH disconnect".into()),
+                    other => Err(format!("unexpected command: {other}")),
+                }
+            };
+            self.commands.lock().unwrap().push(command);
+            result
+        }
+    }
+    let runner = Arc::new(LaunchFailureRunner {
+        commands: StdMutex::new(Vec::new()),
+    });
     let manager = RunManager::with_runner(runner.clone());
 
     let submitted = manager

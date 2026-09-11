@@ -160,6 +160,18 @@ pub(crate) async fn open_mcp_app_child(
     mount_serial: u64,
 ) -> Result<McpAppChildHandle, String> {
     verify_owner(&state, &window, &instance_id)?;
+    // Only a primary workspace can request a fresh binding; old child RPCs cannot.
+    let payload = if state
+        .mcp_app_bridge(&instance_id)
+        .is_some_and(|b| b.server.is_connected())
+    {
+        payload
+    } else {
+        crate::mcp_connections::restore_app(&state, &instance_id)
+            .await?
+            .unwrap_or(payload)
+    };
+    verify_owner(&state, &window, &instance_id)?;
     let frame = mcp_app_frame_id(&instance_id)?;
     if crate::mcp_app_instance_id(frame, &payload) != instance_id {
         return Err("MCP App presentation identity does not match the Tab".into());

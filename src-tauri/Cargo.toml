@@ -94,3 +94,6 @@ windows = { version = "0.61", features = [
 mac-notification-sys = "0.6.15"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

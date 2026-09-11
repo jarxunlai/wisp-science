@@ -37,3 +37,8 @@ harness = false
 name = "mcp_transport"
 path = "tests/mcp_transport.rs"
 harness = false
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+axum = { workspace = true }
+futures-util = { workspace = true }

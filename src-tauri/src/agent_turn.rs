@@ -401,6 +401,12 @@ pub(crate) async fn send_message_inner(
     }
     let mut guard = rt.agent.lock().await;
     rt.discard_stale_agent(&mut guard);
+    if crate::mcp_connections::host()
+        .needs_catalog_refresh(&frame_id)
+        .await
+    {
+        *guard = None;
+    }
     let _progress_subscription =
         progress_observer_id.and_then(|id| channels::activate_progress_observer(id, &frame_id));
     if rt.deleted.load(Ordering::SeqCst) {
@@ -1559,6 +1565,11 @@ pub(crate) async fn stop_agent(
     state: State<'_, AppState>,
     session_id: Option<String>,
 ) -> Result<(), String> {
+    if let Some(id) = session_id.as_deref().filter(|s| !s.is_empty()) {
+        state.mcp_app_tool_bridges.cancel_for_frame(id);
+    } else {
+        state.mcp_app_tool_bridges.cancel_all();
+    }
     // Cancel only the named session's turn; other conversations keep running.
     let targets: Vec<(String, Arc<SessionRuntime>)> =
         match session_id.as_deref().filter(|s| !s.is_empty()) {

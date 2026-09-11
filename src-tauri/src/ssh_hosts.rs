@@ -88,9 +88,12 @@ pub async fn set_session_default_execution_context(
         }
         None => SessionDefaultExecutionContext::Local,
     };
-    persist_session_default_execution_context(&state.store, &session_id, value)
-        .await
-        .map(|saved| saved.stored_value().map(str::to_string))
+    let saved = persist_session_default_execution_context(&state.store, &session_id, value).await?;
+    crate::mcp_connections::host()
+        .reconcile(&state.store, Some(&project.id))
+        .await;
+    crate::clear_session_agent(&state, &session_id).await;
+    Ok(saved.stored_value().map(str::to_string))
 }
 
 #[tauri::command]

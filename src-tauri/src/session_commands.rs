@@ -24,6 +24,13 @@ pub(super) async fn new_session(
     let id = create_session_frame(&state.store, &ap.id).await?;
     state.set_active(window.label(), ap);
     state.set_active_frame(window.label(), Some(id.clone()));
+    let store = state.store.clone();
+    let restored_frame = id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Ok(Some(project)) = store.frame_project_id(&restored_frame).await {
+            crate::mcp_connections::restore(&store, &project, &restored_frame).await;
+        }
+    });
     Ok(id)
 }
 

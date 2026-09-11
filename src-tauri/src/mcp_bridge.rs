@@ -6,9 +6,8 @@
 //! this process is only for Wisp-native capabilities and policy/config reuse.
 
 use crate::{
-    bio_domains, connect_mcp, load_disabled_connectors, load_disabled_skills,
-    load_enabled_skill_names, load_mcp_connections, load_skill_index, load_skill_tags, run_context,
-    ActiveProject,
+    bio_domains, load_disabled_connectors, load_disabled_skills, load_enabled_skill_names,
+    load_mcp_connections, load_skill_index, load_skill_tags, run_context, ActiveProject,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -61,10 +60,11 @@ enum Route {
     },
 }
 
+#[derive(Clone)]
 struct BridgeServer {
     cfg: BridgeConfig,
     store: Store,
-    memory: wisp_core::MemoryManager,
+    memory: Arc<wisp_core::MemoryManager>,
     run_manager: run_context::RunManager,
     runtime_manager: wisp_runtime::RuntimeManager,
     skills: Arc<SkillIndex>,
@@ -133,7 +133,7 @@ impl BridgeServer {
             }
             None => Arc::new(project_skills),
         };
-        let memory = wisp_core::MemoryManager::new(&cfg.project_root);
+        let memory = Arc::new(wisp_core::MemoryManager::new(&cfg.project_root));
         Ok(Self {
             cfg,
             store,
@@ -431,20 +431,14 @@ impl BridgeServer {
     }
 
     async fn register_bundled_bio_tools(&mut self) {
-        if let Ok(command) = std::env::var("WISP_MCP_COMMAND") {
+        if std::env::var("WISP_MCP_COMMAND").is_ok() {
             let allowed = self.allowed_connectors();
             if self.cfg.allowed_tools.is_some() && !allowed.contains("dev-mcp") {
                 return;
             }
-            let parts = command.split_whitespace().collect::<Vec<_>>();
-            let Some((program, args)) = parts.split_first() else {
-                return;
-            };
-            let args = args
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect::<Vec<_>>();
-            let Ok(client) = wisp_mcp::McpClient::launch(program, &args).await else {
+            let Ok(client) =
+                crate::mcp_broker::proxy_client(crate::BUNDLED_DEV_MCP_CONNECTOR_ID).await
+            else {
                 return;
             };
             let client = Arc::new(client);
@@ -549,7 +543,7 @@ impl BridgeServer {
             })
             .collect::<Vec<_>>();
         for conn in conns {
-            let Ok(client) = connect_mcp(&conn).await else {
+            let Ok(client) = crate::mcp_broker::proxy_client(&conn.id).await else {
                 continue;
             };
             let client = Arc::new(client);
@@ -586,7 +580,7 @@ impl BridgeServer {
                 continue;
             }
             let connector_id = launch.connector_id.clone();
-            let Ok(client) = crate::connect_plugin_mcp(&launch).await else {
+            let Ok(client) = crate::mcp_broker::proxy_client(&launch.connector_id).await else {
                 continue;
             };
             let client = Arc::new(client);
@@ -1402,30 +1396,103 @@ fn sanitize_tool_part(raw: &str) -> String {
 }
 
 pub(crate) async fn run_stdio(cfg: BridgeConfig) -> Result<()> {
-    let mut server = BridgeServer::new(cfg).await?;
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut stdout = tokio::io::stdout();
+    let server = Arc::new(tokio::sync::Mutex::new(BridgeServer::new(cfg).await?));
+    // A streaming lease lets the Host cancel this bridge's calls on process loss.
+    let lease = if let Some(config) = crate::mcp_broker::proxy_config() {
+        let (base, token) = (&config.base, &config.token);
+        let url = reqwest::Url::parse(&base)?;
+        if url.host_str() != Some("127.0.0.1") || url.scheme() != "http" {
+            anyhow::bail!("Invalid private MCP broker address");
+        }
+        let mut response = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(format!("{base}/lease"))
+            .bearer_auth(token)
+            .send()
+            .await?
+            .error_for_status()?;
+        Some(tokio::spawn(async move {
+            while matches!(response.chunk().await, Ok(Some(_))) {}
+        }))
+    } else {
+        None
+    };
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let (responses, mut output) = tokio::sync::mpsc::channel::<Value>(64);
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(response) = output.recv().await {
+            stdout.write_all(format!("{response}\n").as_bytes()).await?;
+            stdout.flush().await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    let mut tasks = tokio::task::JoinSet::new();
+    let pending = Arc::new(std::sync::Mutex::new(HashMap::<
+        String,
+        tokio::task::AbortHandle,
+    >::new()));
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
+        if reader.read_line(&mut line).await? == 0 {
             break;
         }
-        let raw = line.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Ok(req) = serde_json::from_str::<JsonRpcIn>(raw) else {
+        let Ok(req) = serde_json::from_str::<JsonRpcIn>(line.trim()) else {
             continue;
         };
-        if let Some(resp) = server.handle(req).await {
-            stdout.write_all(resp.to_string().as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+        if req.method == "notifications/cancelled" {
+            let id = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("requestId"))
+                .map(Value::to_string)
+                .unwrap_or_default();
+            if let Some(task) = pending.lock().unwrap().remove(&id) {
+                task.abort();
+            }
+            continue;
         }
+        let Some(id) = req.id.as_ref().map(Value::to_string) else {
+            continue;
+        };
+        if pending.lock().unwrap().contains_key(&id) || pending.lock().unwrap().len() >= 64 {
+            continue;
+        }
+        let server = server.clone();
+        let responses = responses.clone();
+        let pending_task = pending.clone();
+        let request_id = id.clone();
+        // Start only after the abort handle is registered (avoids completed-task leaks).
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let task = tasks.spawn(async move {
+            let _ = ready.await;
+            let mut snapshot = {
+                let mut server = server.lock().await;
+                if req.method == "tools/call" {
+                    let _ = server.ensure_remote_tools().await;
+                }
+                server.clone()
+            };
+            if let Some(response) = snapshot.handle(req).await {
+                let _ = responses.send(response).await;
+            }
+            pending_task.lock().unwrap().remove(&request_id);
+        });
+        pending.lock().unwrap().insert(id, task);
+        let _ = start.send(());
+        while tasks.try_join_next().is_some() {}
     }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    // Drop the lease only after dropping all call futures; the Host never kills plugins here.
+    if let Some(lease) = lease {
+        lease.abort();
+        let _ = lease.await;
+    }
+    drop(responses);
+    writer.await??;
     Ok(())
 }
 
@@ -1497,6 +1564,7 @@ fn parse_mcp_bridge_cli_args() -> BridgeConfig {
 }
 
 pub fn run_mcp_bridge_cli() {
+    crate::mcp_broker::capture_proxy_environment();
     let cfg = parse_mcp_bridge_cli_args();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

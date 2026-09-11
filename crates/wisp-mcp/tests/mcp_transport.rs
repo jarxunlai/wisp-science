@@ -43,7 +43,6 @@ fn main() -> ExitCode {
 
 fn fake_echo_server() -> ExitCode {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
             return ExitCode::FAILURE;
@@ -55,6 +54,17 @@ fn fake_echo_server() -> ExitCode {
             continue;
         };
         let method = request.get("method").and_then(Value::as_str);
+        let delay = request
+            .pointer("/params/arguments/delay_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if request.pointer("/params/arguments/hold") == Some(&json!(true)) {
+            continue;
+        }
+        if request.pointer("/params/arguments/crash") == Some(&json!(true)) {
+            return ExitCode::FAILURE;
+        }
+        let pause_input = request.pointer("/params/arguments/pause_input") == Some(&json!(true));
         let result = match method {
             Some("initialize") => json!({
                 "protocolVersion": "2024-11-05",
@@ -80,13 +90,6 @@ fn fake_echo_server() -> ExitCode {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                let delay = arguments
-                    .get("delay_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if delay > 0 {
-                    std::thread::sleep(Duration::from_millis(delay));
-                }
                 if arguments.get("rich") == Some(&json!(true)) {
                     json!({
                         "content": [
@@ -111,17 +114,71 @@ fn fake_echo_server() -> ExitCode {
             _ => json!({}),
         };
         let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
-            return ExitCode::FAILURE;
+        std::thread::spawn(move || {
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{response}");
+            let _ = stdout.flush();
+        });
+        if pause_input {
+            std::thread::sleep(Duration::from_millis(300));
         }
     }
     ExitCode::SUCCESS
 }
 
 async fn run_stdio_transport_regressions() -> Result<(), String> {
+    agent_stop_cancels_wait_not_server().await?;
     deferred_tool_retains_rich_result().await?;
     concurrent_stdio_calls_keep_matching_ids().await?;
-    cancelled_isolated_call_leaves_connection_usable().await
+    cancelled_isolated_call_leaves_connection_usable().await?;
+    unlimited_stdio_and_late_response().await?;
+    cancellation_during_write_preserves_framing().await?;
+    managed_stdio_reconnects_without_replay().await
+}
+
+struct CancelEnv(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl ToolEnv for CancelEnv {
+    fn project_root(&self) -> &std::path::Path {
+        std::path::Path::new(".")
+    }
+    async fn confirm(&self, _: &str) -> bool {
+        true
+    }
+    async fn emit(&self, _: ToolEvent) {}
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+async fn agent_stop_cancels_wait_not_server() -> Result<(), String> {
+    use wisp_tools::Tool;
+    let client = echo().await?;
+    let remote = client
+        .tools_list()
+        .await
+        .map_err(|e| e.to_string())?
+        .remove(0);
+    let tool = wisp_mcp::McpTool::new(remote, client.clone());
+    let env = CancelEnv(std::sync::atomic::AtomicBool::new(false));
+    let args = json!({"token":"held","hold":true});
+    let (result, ()) = tokio::join!(tool.run(&args, &env), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        env.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert!(!result.success);
+    assert!(result.content.contains("outcome may be unknown"));
+    assert!(client.is_connected());
+    assert_eq!(
+        client
+            .tool_call("echo", &json!({"token":"next"}))
+            .await
+            .map_err(|e| e.to_string())?,
+        "ok"
+    );
+    client.shutdown().await.map_err(|e| e.to_string())
 }
 
 async fn deferred_tool_retains_rich_result() -> Result<(), String> {
@@ -232,4 +289,108 @@ async fn cancelled_isolated_call_leaves_connection_usable() -> Result<(), String
     }
     client.shutdown().await.map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn echo() -> Result<std::sync::Arc<McpClient>, String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    McpClient::launch(&executable.to_string_lossy(), &[ECHO_ARG.into()])
+        .await
+        .map(std::sync::Arc::new)
+        .map_err(|e| e.to_string())
+}
+async fn unlimited_stdio_and_late_response() -> Result<(), String> {
+    let client = echo().await?;
+    let call = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .tool_call("echo", &json!({"token":"hold","hold":true}))
+                .await
+        })
+    };
+    // An ordered, independent round trip establishes that the held call was written.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    client.tools_list().await.map_err(|e| e.to_string())?;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !call.is_finished(),
+        "stdio tools/call must have no execution deadline"
+    );
+    tokio::time::resume();
+    call.abort();
+    let _ = call.await;
+    assert!(client.is_connected());
+    assert_eq!(
+        client
+            .tool_call("echo", &json!({"token":"next"}))
+            .await
+            .map_err(|e| e.to_string())?,
+        "ok"
+    );
+    client.shutdown().await.map_err(|e| e.to_string())
+}
+async fn cancellation_during_write_preserves_framing() -> Result<(), String> {
+    let client = echo().await?;
+    client
+        .tool_call("echo", &json!({"token":"pause","pause_input":true}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let call = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .tool_call("echo", &json!({"token":"x".repeat(8*1024*1024)}))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    call.abort();
+    let _ = call.await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.tool_call("echo", &json!({"token":"after-partial-write"})),
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    assert_eq!(result, "ok");
+    assert!(client.is_connected());
+    client.shutdown().await.map_err(|e| e.to_string())
+}
+async fn managed_stdio_reconnects_without_replay() -> Result<(), String> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wisp_mcp::connection::{ClientFactory, ManagedConnection};
+    let launches = Arc::new(AtomicUsize::new(0));
+    let observed = launches.clone();
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let factory: ClientFactory = Arc::new(move || {
+        let executable = executable.clone();
+        observed.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            McpClient::launch(&executable.to_string_lossy(), &[ECHO_ARG.into()]).await
+        })
+    });
+    let client = Arc::new(McpClient::managed(ManagedConnection::new(factory)));
+    client.tools_list().await.map_err(|e| e.to_string())?;
+    let error = client
+        .tool_call("echo", &json!({"token":"write","crash":true}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("outcome unknown"));
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..6 {
+        let client = client.clone();
+        tasks.spawn(async move { client.tool_call("echo", &json!({"token":"new"})).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        assert_eq!(result.unwrap().unwrap(), "ok");
+    }
+    assert_eq!(launches.load(Ordering::SeqCst), 2);
+    client.shutdown().await.map_err(|e| e.to_string())
 }

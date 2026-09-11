@@ -53,7 +53,7 @@ pub(crate) struct NormalizedPluginManifest {
     pub mcp_servers: Vec<PluginMcpServer>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct PluginMcpLaunch {
     pub plugin_id: String,
     pub connector_id: String,

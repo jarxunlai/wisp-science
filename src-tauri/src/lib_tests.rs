@@ -355,7 +355,7 @@ async fn mcp_app_host_timeout_fails_only_the_call() {
         &server,
         "figure_preview_exact",
         &serde_json::json!({}),
-        std::time::Duration::from_millis(15),
+        Some(std::time::Duration::from_millis(15)),
     )
     .await
     .unwrap_err();
@@ -370,7 +370,7 @@ async fn mcp_app_host_timeout_fails_only_the_call() {
         &fast,
         "figure_preview_exact",
         &serde_json::json!({}),
-        std::time::Duration::from_millis(50),
+        None,
     )
     .await
     .unwrap();
@@ -3197,4 +3197,27 @@ fn dump_child_env(pairs: &[(OsString, OsString)]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+#[tokio::test(start_paused = true)]
+async fn mcp_app_default_allows_calls_longer_than_old_limits() {
+    assert!(super::MCP_APP_TOOL_CALL_TIMEOUT.is_none());
+    let task = tokio::spawn(async {
+        let server = FakeAppServer {
+            connector_id: "figure-library".into(),
+            tool: "figure_preview_exact".into(),
+            delay: Some(std::time::Duration::from_secs(130)),
+        };
+        super::invoke_mcp_app_server_tool(
+            &server,
+            "figure_preview_exact",
+            &serde_json::json!({}),
+            super::MCP_APP_TOOL_CALL_TIMEOUT,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(121)).await;
+    assert!(!task.is_finished());
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    assert!(task.await.unwrap().is_ok());
 }

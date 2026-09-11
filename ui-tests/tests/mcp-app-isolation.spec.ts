@@ -175,3 +175,53 @@ test("child shell preserves sandbox/CSP and directly forwards guest protocol", a
   await page.waitForTimeout(50);
   expect(await page.evaluate(() => (window as any).__shellCalls.filter((c:any)=>c.command==="mcp_app_child_request").length)).toBe(2);
 });
+test("restored App binds fresh resources without replaying a tool call", async ({page}) => {
+  const frame = await start(page);
+  await page.evaluate(() => {
+    const w = window as any, original = w.__TAURI__.core.invoke;
+    w.__restoreCalls = [];
+    w.__TAURI__.core.invoke = async (command: string, args: any) => {
+      w.__restoreCalls.push(command);
+      if (command === "prepare_mcp_app") return {
+        tool:{name:"figures_open",title:"Restored figures"},
+        resource:{uri:"ui://figures/view",text:"<body>fresh resource</body>"},
+        arguments:{}, result:{content:[]}, _wispHistoricalResult:true,
+      };
+      return original(command, args);
+    };
+  });
+  await page.evaluate(frame => (window as any).__tauriEmit("agent", {
+    kind:"ToolPresentation", frame_id:frame, presentation_kind:"mcp_app",
+    payload:{tool:{name:"figures_open",title:"Restored figures"},
+      resource:{uri:"ui://figures/view",text:"<body>old resource</body>"},
+      arguments:{},result:{content:[]},
+      _wispMcpBinding:{version:1,frame_id:frame,project_id:"p",connector_id:"fixture"}},
+  }), frame);
+  await expect.poll(() => calls(page,"open_mcp_app_child")).toHaveLength(1);
+  const opened = (await calls(page,"open_mcp_app_child"))[0];
+  expect(opened.args.payload.resource.text).toContain("fresh resource");
+  await expect(page.locator(".mcp-app-isolation-controls")).toContainText("results are historical");
+  expect(await page.evaluate(() => (window as any).__restoreCalls.filter((c:string)=>c === "mcp_app_call_tool"))).toHaveLength(0);
+});
+
+test("forced reconnect warns about unknown outcomes and needs confirmation", async ({page}) => {
+  const frame = await start(page);
+  await present(page,frame);
+  await expect.poll(() => calls(page,"open_mcp_app_child")).toHaveLength(1);
+  await page.evaluate(() => {
+    const w = window as any, original = w.__TAURI__.core.invoke;
+    w.__restartCalls = [];
+    w.__TAURI__.core.invoke = async (command:string,args:any) => {
+      if (command === "restart_session_mcp") { w.__restartCalls.push(args); return null; }
+      return original(command,args);
+    };
+  });
+  page.once("dialog", async dialog => { expect(dialog.message()).toContain("will not be replayed"); await dialog.dismiss(); });
+  await page.getByRole("button",{name:"Reconnect plugins",exact:true}).click();
+  expect(await page.evaluate(() => (window as any).__restartCalls)).toHaveLength(0);
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button",{name:"Reconnect plugins",exact:true}).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__restartCalls)).toHaveLength(1);
+  await expect.poll(() => calls(page,"open_mcp_app_child")).toHaveLength(2);
+  expect((await page.evaluate(() => (window as any).__restartCalls))[0].confirmOutcomeUnknown).toBe(true);
+});

@@ -2831,8 +2831,31 @@ function mcpAppDocumentKey(payload) {
 /** Mount one MCP App inside a host-owned center pane. The app keeps an opaque
  * origin and scripts only; filesystem, forms, popups, top navigation,
  * downloads, and same-origin access remain unavailable. */
+const legacyMcpMounts = new Map();
 export function mount_mcp_app(instanceId, elId, payloadJson) {
   if (useIsolatedHost()) return mountIsolatedApp(instanceId, elId, payloadJson);
+  const target = document.getElementById(elId);
+  if (!target) return false;
+  const incoming = typeof payloadJson === "string" ? JSON.parse(payloadJson) : payloadJson;
+  // Legacy records remain displayable without inventing a connector binding.
+  if (!incoming?._wispMcpBinding) return mountLegacyMcpApp(instanceId, elId, payloadJson);
+  const ticket = {}; legacyMcpMounts.set(instanceId, ticket);
+  // A reconnect may only bind a newly mounted frame, never an old guest callback.
+  const old = mcpAppInstances.get(instanceId);
+  if (old) {
+    mcpAppInstances.delete(instanceId);
+    window.removeEventListener("message", old.onMessage);
+    old.requestTeardown("primary workspace remount");
+  }
+  void invoke("prepare_mcp_app", {instanceId}).then((fresh) => {
+    if (legacyMcpMounts.get(instanceId) !== ticket || !target.isConnected) return;
+    mountLegacyMcpApp(instanceId, elId, fresh ? JSON.stringify(fresh) : payloadJson);
+  }).catch((error) => {
+    if (legacyMcpMounts.get(instanceId) === ticket && target.isConnected) target.textContent = String(error);
+  });
+  return true;
+}
+function mountLegacyMcpApp(instanceId, elId, payloadJson) {
   const target = document.getElementById(elId);
   if (!target) return false;
   let instance = mcpAppInstances.get(instanceId);
@@ -2874,6 +2897,7 @@ export function mount_mcp_app(instanceId, elId, payloadJson) {
 
 /** Keep a live iframe attached off-screen while another center tab is active. */
 export function park_mcp_app(instanceId) {
+  legacyMcpMounts.delete(instanceId);
   if (useIsolatedHost()) return suspendIsolatedApp(instanceId);
   const instance = isolatedApps.get(instanceId) || mcpAppInstances.get(instanceId);
   if (!instance) return;

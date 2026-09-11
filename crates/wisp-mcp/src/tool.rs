@@ -123,30 +123,33 @@ impl McpTool {
 /// Host-side `serverTools` bridge handed to the desktop host when an MCP App
 /// is presented. The host stores it keyed by the app instance so `tools/call`
 /// from the iframe reuses the exact MCP connection that presented the app.
-/// Holds a `Weak` client on purpose: when the owning agent drops its tools
-/// (session end, connector restart, agent rebuild), the bridge reports a
-/// stale instance instead of pinning the MCP server process forever.
+/// The Host owns the stable client. A view holds only a Weak reference plus
+/// a physical-connection generation: rebuilding an Agent does not kill the
+/// server, but reconnecting cannot silently authorize callbacks from an old App.
 pub struct McpAppServerHandle {
     connector_id: String,
     app_name: String,
     catalog: Arc<Vec<RemoteTool>>,
     client: Weak<McpClient>,
+    generation: u64,
     require_approval: bool,
 }
 
 impl McpAppServerHandle {
-    pub(crate) fn new(
+    pub fn new(
         connector_id: String,
         app_name: String,
         catalog: Arc<Vec<RemoteTool>>,
         client: Weak<McpClient>,
         require_approval: bool,
     ) -> Self {
+        let generation = client.upgrade().map_or(0, |c| c.generation());
         Self {
             connector_id,
             app_name,
             catalog,
             client,
+            generation,
             require_approval,
         }
     }
@@ -161,7 +164,7 @@ impl McpAppServer for McpAppServerHandle {
     fn is_connected(&self) -> bool {
         self.client
             .upgrade()
-            .is_some_and(|client| client.is_connected())
+            .is_some_and(|client| client.is_connected() && client.generation() == self.generation)
     }
     fn connector_id(&self) -> &str {
         &self.connector_id
@@ -200,8 +203,15 @@ impl McpAppServer for McpAppServerHandle {
             .client
             .upgrade()
             .ok_or_else(|| "the MCP server connection for this App is closed")?;
+        if !self.is_connected() {
+            return Err("stale-instance: reopen the MCP App after reconnecting".into());
+        }
         let result = client
-            .tool_call_rich_isolated(name, arguments)
+            .tool_call_checked_generation(
+                self.tool(name).ok_or("MCP tool no longer exists")?,
+                arguments,
+                Some(self.generation),
+            )
             .await
             .map_err(|error| error.to_string())?;
         serde_json::to_value(&result).map_err(|error| format!("serialize MCP tool result: {error}"))
@@ -463,26 +473,36 @@ impl Tool for McpTool {
         s.chars().take(120).collect()
     }
     async fn run(&self, args: &Value, env: &dyn ToolEnv) -> ToolResult {
-        match self.client.tool_call_rich(&self.name, args).await {
-            Ok(result) => {
-                let mut output = crate::result::model_result(&result);
-                let artifacts = materialize_html_resources(&result, env.project_root(), env).await;
-                if !artifacts.is_empty() {
-                    output.content.push_str("\n\nGenerated artifacts: ");
-                    output.content.push_str(
-                        &artifacts
-                            .iter()
-                            .map(|path| path.to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
+        let call = async {
+            match self.client.tool_call_checked(&self.remote, args).await {
+                Ok(result) => {
+                    let mut output = crate::result::model_result(&result);
+                    let artifacts =
+                        materialize_html_resources(&result, env.project_root(), env).await;
+                    if !artifacts.is_empty() {
+                        output.content.push_str("\n\nGenerated artifacts: ");
+                        output.content.push_str(
+                            &artifacts
+                                .iter()
+                                .map(|path| path.to_string_lossy())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                    }
+                    if let Some(uri) = self.remote.ui_resource_uri() {
+                        self.emit_mcp_app(uri, args, &result, env).await;
+                    }
+                    output
                 }
-                if let Some(uri) = self.remote.ui_resource_uri() {
-                    self.emit_mcp_app(uri, args, &result, env).await;
-                }
-                output
+                Err(e) => ToolResult::fail(format!("mcp {name} error: {e}", name = self.name)),
             }
-            Err(e) => ToolResult::fail(format!("mcp {name} error: {e}", name = self.name)),
+        };
+        tokio::select! {
+            result = call => result,
+            _ = async { loop {
+                if env.is_cancelled() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            } } => ToolResult::fail("MCP wait cancelled by user; server kept alive. External operation outcome may be unknown; do not replay automatically."),
         }
     }
 }

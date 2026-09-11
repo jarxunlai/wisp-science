@@ -7324,7 +7324,9 @@ version = "1.11.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
+ "futures-util",
  "libc",
  "regex",
  "reqwest 0.12.28",

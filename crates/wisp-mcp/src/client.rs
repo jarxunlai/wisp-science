@@ -12,23 +12,21 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::Instrument;
 use wisp_tools::process::ProcessTree;
 
-/// Hard cap on a single stdio JSON-RPC exchange, matching the HTTP transport's
-/// request timeout. Without it a hung server blocks the agent turn forever.
-/// Exceeding this cap closes the stdio transport and terminates its process
-/// tree. In-flight waiters are failed; a late response for a timed-out id is
-/// dropped instead of being delivered to a different caller.
-const STDIO_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Technical exchanges are bounded; tools/call deliberately has no deadline.
+const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const STDIO_SHUTDOWN_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 const STDIO_SHUTDOWN_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 const STDIO_SHUTDOWN_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const STDIO_SHUTDOWN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemoteTool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,7 +103,7 @@ impl RemoteTool {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpCallResult {
     pub content: Vec<Value>,
     #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
@@ -156,15 +154,17 @@ type StdioWaiters =
 enum Transport {
     Stdio {
         stdin: Arc<Mutex<Option<ChildStdin>>>,
+        writer: mpsc::Sender<StdioWrite>,
         waiters: StdioWaiters,
         child: Mutex<Option<tokio::process::Child>>,
         process_tree: ProcessTree,
-        closing: AtomicBool,
+        closing: Arc<AtomicBool>,
         terminated: AtomicBool,
         shutdown_lock: Mutex<()>,
         next_id: AtomicU64,
     },
     Http(HttpTransport),
+    Managed(crate::connection::ManagedConnection),
 }
 
 struct HttpTransport {
@@ -173,11 +173,135 @@ struct HttpTransport {
     headers: Vec<(String, String)>,
     session_id: tokio::sync::Mutex<Option<String>>,
     next_id: AtomicU64,
+    closing: Arc<AtomicBool>,
+}
+
+struct StdioWrite {
+    frame: Vec<u8>,
+    request: Option<(u64, Arc<AtomicBool>)>,
+    done: oneshot::Sender<Result<()>>,
+}
+
+impl HttpTransport {
+    fn post(&self) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(&self.url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        for (key, value) in &self.headers {
+            request = request.header(key, value);
+        }
+        request
+    }
+}
+
+#[derive(Debug)]
+struct RemoteRpcError(String);
+impl std::fmt::Display for RemoteRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MCP error: {}", self.0)
+    }
+}
+impl std::error::Error for RemoteRpcError {}
+
+fn rpc_result(response: JsonRpcResp, expected: u64) -> Result<Value> {
+    if response.id != Some(expected) {
+        return Err(anyhow!("MCP response id mismatch"));
+    }
+    if let Some(error) = response.error {
+        return Err(RemoteRpcError(error.message).into());
+    }
+    Ok(response.result.unwrap_or(Value::Null))
+}
+
+/// Incremental SSE framing, including CRLF, multiline data and split UTF-8.
+/// Limits apply per pending event, not to the lifetime of a long-running stream.
+#[derive(Default)]
+struct SseDecoder {
+    line: Vec<u8>,
+    data: Vec<u8>,
+}
+impl SseDecoder {
+    fn feed(&mut self, bytes: &[u8], id: u64) -> Result<Option<Value>> {
+        for byte in bytes {
+            if *byte != b'\n' {
+                self.line.push(*byte);
+                if self.line.len() + self.data.len() > MAX_RESPONSE_BYTES {
+                    return Err(anyhow!("MCP SSE event too large"));
+                }
+                continue;
+            }
+            if self.line.last() == Some(&b'\r') {
+                self.line.pop();
+            }
+            if self.line.is_empty() {
+                let data = std::mem::take(&mut self.data);
+                if let Ok(response) = serde_json::from_slice::<JsonRpcResp>(&data) {
+                    if response.id == Some(id) {
+                        return rpc_result(response, id).map(Some);
+                    }
+                }
+            } else if let Some(data) = self.line.strip_prefix(b"data:") {
+                let data = data.strip_prefix(b" ").unwrap_or(data);
+                self.data.extend_from_slice(data);
+                self.data.push(b'\n');
+            }
+            self.line.clear();
+        }
+        Ok(None)
+    }
+}
+
+fn spawn_stdio_writer(
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    waiters: StdioWaiters,
+    closing: Arc<AtomicBool>,
+) -> mpsc::Sender<StdioWrite> {
+    let (tx, mut rx) = mpsc::channel::<StdioWrite>(64);
+    tokio::spawn(
+        async move {
+            while let Some(write) = rx.recv().await {
+                // Once writing starts, always complete this frame, even if its caller drops.
+                if closing.load(Ordering::SeqCst) {
+                    break;
+                }
+                let result = async {
+                    let mut stdin = stdin.lock().await;
+                    let stdin = stdin.as_mut().ok_or_else(|| anyhow!("MCP stdin closed"))?;
+                    if let Some((id, sent)) = &write.request {
+                        if !waiters.lock().unwrap().contains_key(id) {
+                            return Ok(());
+                        }
+                        sent.store(true, Ordering::SeqCst);
+                    }
+                    stdin.write_all(&write.frame).await?;
+                    stdin.flush().await?;
+                    Ok(())
+                }
+                .await;
+                let failed = result.is_err();
+                let _ = write.done.send(result);
+                if failed {
+                    closing.store(true, Ordering::SeqCst);
+                    tracing::warn!(target: "wisp", "mcp.connection.disconnected: write failure");
+                    fail_stdio_waiters(
+                        &waiters,
+                        "MCP write failed; operation outcome unknown, do not replay",
+                    );
+                    break;
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+    tx
 }
 
 /// Pull the JSON-RPC response with `expected_id` out of a `text/event-stream`
 /// body. Each SSE frame carries one JSON object on a `data:` line; we scan
 /// every data line and return the first whose id matches.
+#[cfg(test)]
 fn parse_jsonrpc_from_sse(body: &str, expected_id: u64) -> Result<Value> {
     for line in body.lines() {
         let line = line.trim_start();
@@ -207,40 +331,43 @@ pub struct McpClient {
     transport: Transport,
 }
 
-/// How a stdio JSON-RPC call behaves when it is cancelled or hits the
-/// transport timeout. Agent turns tear down the process so a hung server
-/// cannot block the next turn. MCP App iframe calls must not: one preview
-/// or pager request should fail without killing the shared server.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StdioCallPolicy {
-    TeardownProcess,
-    IsolateCall,
-}
-
+/// The writer owns frames independently of request futures.
 struct StdioWaiterGuard {
     waiters: StdioWaiters,
+    writer: mpsc::Sender<StdioWrite>,
     id: u64,
-    armed: bool,
+    cancel: bool,
+    sent: Arc<AtomicBool>,
 }
-
-impl StdioWaiterGuard {
-    fn new(waiters: StdioWaiters, id: u64) -> Self {
-        Self {
-            waiters,
-            id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
 impl Drop for StdioWaiterGuard {
     fn drop(&mut self) {
-        if self.armed {
-            self.waiters.lock().unwrap().remove(&self.id);
+        self.waiters.lock().unwrap().remove(&self.id);
+        if self.cancel && self.sent.load(Ordering::SeqCst) {
+            tracing::info!(target: "wisp", request_id = self.id, "mcp.request.cancelled; external outcome may be unknown");
+            let (done, _) = oneshot::channel();
+            let frame = format!("{}\n", json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":self.id,"reason":"Caller stopped waiting; no rollback implied"}})).into_bytes();
+            let _ = self.writer.try_send(StdioWrite {
+                frame,
+                request: None,
+                done,
+            });
+        }
+    }
+}
+struct HttpCancellation {
+    request: Option<reqwest::RequestBuilder>,
+}
+impl Drop for HttpCancellation {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = request
+                        .timeout(std::time::Duration::from_secs(2))
+                        .send()
+                        .await;
+                });
+            }
         }
     }
 }
@@ -295,7 +422,8 @@ impl McpClient {
                             .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
                     })
             }
-            Transport::Http(_) => true,
+            Transport::Http(h) => !h.closing.load(Ordering::SeqCst),
+            Transport::Managed(m) => m.is_connected(),
         }
     }
     /// Spawn `command args...` and perform the MCP initialize handshake.
@@ -323,7 +451,10 @@ impl McpClient {
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let waiters: StdioWaiters = Arc::new(StdMutex::new(HashMap::new()));
-        spawn_stdio_reader(stdout, Arc::clone(&waiters));
+        let closing = Arc::new(AtomicBool::new(false));
+        spawn_stdio_reader(stdout, Arc::clone(&waiters), closing.clone());
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
+        let writer = spawn_stdio_writer(stdin.clone(), waiters.clone(), closing.clone());
         let stderr = child.stderr.take();
         // Drain stderr in the background so a chatty server cannot fill the
         // pipe; keep a short tail for initialize failures.
@@ -343,7 +474,10 @@ impl McpClient {
                             t.push_str(&chunk);
                             // Keep last ~2 KiB.
                             if t.len() > 2048 {
-                                let drop_n = t.len() - 2048;
+                                let mut drop_n = t.len() - 2048;
+                                while !t.is_char_boundary(drop_n) {
+                                    drop_n += 1;
+                                }
                                 t.drain(..drop_n);
                             }
                         }
@@ -354,11 +488,12 @@ impl McpClient {
 
         let client = Self {
             transport: Transport::Stdio {
-                stdin: Arc::new(Mutex::new(Some(stdin))),
+                stdin,
+                writer,
                 waiters,
                 child: Mutex::new(Some(child)),
                 process_tree,
-                closing: AtomicBool::new(false),
+                closing,
                 terminated: AtomicBool::new(false),
                 shutdown_lock: Mutex::new(()),
                 next_id: AtomicU64::new(1),
@@ -412,12 +547,8 @@ impl McpClient {
         headers: &[(String, String)],
         proxy: &str,
     ) -> Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            // ponytail: 120s request ceiling so a connected-but-hung host eventually
-            // errors instead of blocking a turn forever; raise if a legit HTTP MCP
-            // tool call needs longer than this.
-            .timeout(std::time::Duration::from_secs(120));
+        let mut builder =
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         builder = match proxy.trim() {
             "" => builder,
             "none" => builder.no_proxy(),
@@ -430,6 +561,7 @@ impl McpClient {
                 url: url.to_string(),
                 headers: headers.to_vec(),
                 session_id: tokio::sync::Mutex::new(None),
+                closing: Arc::new(AtomicBool::new(false)),
                 next_id: AtomicU64::new(1),
             }),
         };
@@ -451,210 +583,295 @@ impl McpClient {
         Ok(client)
     }
 
-    async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
-        self.request_with(method, params, StdioCallPolicy::TeardownProcess)
+    pub fn managed(connection: crate::connection::ManagedConnection) -> Self {
+        Self {
+            transport: Transport::Managed(connection),
+        }
+    }
+    pub fn generation(&self) -> u64 {
+        match &self.transport {
+            Transport::Managed(m) => m.generation(),
+            _ => 0,
+        }
+    }
+    pub fn needs_catalog_refresh(&self) -> bool {
+        match &self.transport {
+            Transport::Managed(m) => m.needs_catalog_refresh(),
+            _ => false,
+        }
+    }
+    pub fn mark_catalog_current(&self) {
+        if let Transport::Managed(m) = &self.transport {
+            m.mark_catalog_current();
+        }
+    }
+    pub async fn tool_call_checked(
+        &self,
+        expected: &RemoteTool,
+        args: &Value,
+    ) -> Result<McpCallResult> {
+        self.tool_call_checked_generation(expected, args, None)
             .await
     }
-
-    async fn request_with(
+    pub async fn tool_call_checked_generation(
         &self,
-        method: &str,
-        params: Option<Value>,
-        policy: StdioCallPolicy,
-    ) -> Result<Value> {
-        match &self.transport {
-            Transport::Stdio {
-                stdin,
-                waiters,
-                child,
-                process_tree,
-                closing,
-                terminated,
-                shutdown_lock,
-                next_id,
-            } => {
-                if closing.load(Ordering::SeqCst) {
-                    return Err(anyhow!("MCP stdio connection is shutting down"));
-                }
-                let id = next_id.fetch_add(1, Ordering::SeqCst);
-                let req = JsonRpcReq {
-                    jsonrpc: "2.0",
-                    id,
-                    method: method.to_string(),
-                    params,
-                };
-                let val = serde_json::to_value(&req)?;
-                let (tx, rx) = oneshot::channel();
-                waiters.lock().unwrap().insert(id, tx);
-                let mut waiter_guard = StdioWaiterGuard::new(Arc::clone(waiters), id);
-                let exchange = async {
-                    {
-                        let mut w = stdin.lock().await;
-                        let w = w
-                            .as_mut()
-                            .ok_or_else(|| anyhow!("MCP server stdin is closed"))?;
-                        w.write_all(val.to_string().as_bytes()).await?;
-                        w.write_all(b"\n").await?;
-                        w.flush().await?;
-                    }
-                    match rx.await {
-                        Ok(Ok(resp)) => {
-                            if let Some(e) = resp.error {
-                                return Err(anyhow!("MCP error: {}", e.message));
-                            }
-                            Ok(resp.result.unwrap_or(Value::Null))
-                        }
-                        Ok(Err(error)) => Err(error),
-                        Err(_) => Err(anyhow!("MCP stdio response channel closed")),
-                    }
-                };
-                let mut cancellation = CancellationCleanup {
-                    process_tree,
-                    child,
-                    closing,
-                    armed: matches!(policy, StdioCallPolicy::TeardownProcess),
-                };
-                match tokio::time::timeout(STDIO_REQUEST_TIMEOUT, exchange).await {
-                    Ok(Ok(result)) => {
-                        waiter_guard.disarm();
-                        cancellation.disarm();
-                        Ok(result)
-                    }
-                    Ok(Err(error)) => {
-                        waiters.lock().unwrap().remove(&id);
-                        waiter_guard.disarm();
-                        cancellation.disarm();
-                        Err(error)
-                    }
-                    Err(_) => {
-                        waiters.lock().unwrap().remove(&id);
-                        waiter_guard.disarm();
-                        let message = format!(
-                            "MCP stdio request '{method}' timed out after {}s",
-                            STDIO_REQUEST_TIMEOUT.as_secs()
-                        );
-                        match policy {
-                            StdioCallPolicy::IsolateCall => {
-                                cancellation.disarm();
-                                Err(anyhow!(message))
-                            }
-                            StdioCallPolicy::TeardownProcess => {
-                                let cleanup = shutdown_stdio(
-                                    stdin,
-                                    child,
-                                    process_tree,
-                                    closing,
-                                    terminated,
-                                    shutdown_lock,
-                                    waiters,
-                                )
-                                .await;
-                                cancellation.disarm();
-                                match cleanup {
-                                    Ok(()) => Err(anyhow!(message)),
-                                    Err(error) => {
-                                        Err(anyhow!("{message}; shutdown failed: {error}"))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        expected: &RemoteTool,
+        args: &Value,
+        generation: Option<u64>,
+    ) -> Result<McpCallResult> {
+        if let Transport::Managed(m) = &self.transport {
+            if generation.is_some() && !m.is_connected() {
+                return Err(anyhow!("stale-instance: reopen the MCP App"));
             }
-            Transport::Http(h) => {
-                let id = h.next_id.fetch_add(1, Ordering::SeqCst);
-                let req = JsonRpcReq {
-                    jsonrpc: "2.0",
-                    id,
-                    method: method.to_string(),
-                    params,
-                };
-                let mut rb = h
-                    .client
-                    .post(&h.url)
-                    .header("content-type", "application/json")
-                    .header("accept", "application/json, text/event-stream")
-                    .json(&req);
-                if let Some(sid) = h.session_id.lock().await.clone() {
-                    rb = rb.header("mcp-session-id", sid);
-                }
-                for (k, v) in &h.headers {
-                    rb = rb.header(k.as_str(), v.as_str());
-                }
-                let resp = rb
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("http mcp request: {e}"))?;
-                if let Some(sid) = resp
-                    .headers()
-                    .get("mcp-session-id")
-                    .and_then(|v| v.to_str().ok())
-                {
-                    *h.session_id.lock().await = Some(sid.to_string());
-                }
-                let ctype = resp
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let status = resp.status();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| anyhow!("http mcp body: {e}"))?;
-                if !status.is_success() {
+            let prior = m.is_connected().then(|| m.generation());
+            let client = m.ready().instrument(m.span()).await?;
+            if prior.is_some_and(|g| g != m.generation()) {
+                return Err(anyhow!("MCP connection changed while queued; request not sent. Issue a new request after reviewing the previous outcome."));
+            }
+            let catalog = client.tools_list().await?;
+            if generation.is_some_and(|g| g != m.generation()) {
+                return Err(anyhow!("stale-instance: reopen the MCP App"));
+            }
+            if catalog.iter().find(|t| t.name == expected.name) != Some(expected) {
+                m.catalog_changed();
+                return Err(anyhow!("MCP tool catalog changed; reopen the tool/refresh the conversation before approval and retry. Nothing was sent."));
+            }
+            crate::tool::validate_tool_arguments(&expected.input_schema, args)
+                .map_err(|e| anyhow!(e))?;
+            return client
+                .tool_call_rich(&expected.name, args)
+                .instrument(m.span())
+                .await;
+        }
+        self.tool_call_rich(&expected.name, args).await
+    }
+    async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        let exchange = self.request_exchange(method, params);
+        if method == "tools/call" {
+            exchange.await
+        } else {
+            tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, exchange)
+                .await
+                .map_err(|_| {
+                    anyhow!("MCP control request '{method}' timed out; connection not terminated")
+                })?
+        }
+    }
+    async fn request_exchange(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        match &self.transport {
+            Transport::Managed(m) => {
+                let prior = m.is_connected().then(|| m.generation());
+                let client = m.ready().instrument(m.span()).await?;
+                if method == "tools/call" && prior.is_some_and(|g| g != m.generation()) {
                     return Err(anyhow!(
-                        "http mcp {status}: {}",
-                        text.chars().take(200).collect::<String>()
+                        "MCP connection changed while queued; request not sent"
                     ));
                 }
-                if ctype.contains("text/event-stream") {
-                    parse_jsonrpc_from_sse(&text, id)
-                } else {
-                    let resp: JsonRpcResp = serde_json::from_str(text.trim())?;
-                    if let Some(e) = resp.error {
-                        return Err(anyhow!("MCP error: {}", e.message));
-                    }
-                    Ok(resp.result.unwrap_or(Value::Null))
+                Box::pin(client.request(method, params))
+                    .instrument(m.span())
+                    .await
+            }
+            Transport::Stdio {
+                writer,
+                waiters,
+                closing,
+                next_id,
+                ..
+            } => {
+                if closing.load(Ordering::SeqCst) {
+                    return Err(anyhow!("MCP connection disconnected; request not sent"));
                 }
+                let id = next_id.fetch_add(1, Ordering::SeqCst);
+                let tool = params
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let started = std::time::Instant::now();
+                tracing::info!(target: "wisp", request_id=id, method, tool, "mcp.request.started");
+                let frame = format!(
+                    "{}\n",
+                    serde_json::to_string(&JsonRpcReq {
+                        jsonrpc: "2.0",
+                        id,
+                        method: method.into(),
+                        params
+                    })?
+                )
+                .into_bytes();
+                let (tx, rx) = oneshot::channel();
+                waiters.lock().unwrap().insert(id, tx);
+                let started_write = Arc::new(AtomicBool::new(false));
+                let mut guard = StdioWaiterGuard {
+                    sent: started_write.clone(),
+                    waiters: waiters.clone(),
+                    writer: writer.clone(),
+                    id,
+                    cancel: method != "initialize",
+                };
+                let (done, sent) = oneshot::channel();
+                writer
+                    .send(StdioWrite {
+                        frame,
+                        request: Some((id, started_write)),
+                        done,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("MCP writer closed; request not sent"))?;
+                sent.await
+                    .map_err(|_| {
+                        anyhow!("MCP write interrupted; operation outcome unknown, do not replay")
+                    })?
+                    .map_err(|error| {
+                        if guard.sent.load(Ordering::SeqCst) {
+                            error.context(
+                                "MCP write failed; operation outcome unknown, do not replay",
+                            )
+                        } else {
+                            error.context("MCP request not sent")
+                        }
+                    })?;
+                let response = rx.await.map_err(|_| {
+                    anyhow!("MCP response lost; operation outcome unknown, do not replay")
+                })?;
+                guard.cancel = false;
+                let result = response.and_then(|response| rpc_result(response, id));
+                tracing::info!(target: "wisp", request_id=id, method, elapsed_ms=started.elapsed().as_millis() as u64, success=result.is_ok(), "mcp.request.finished");
+                result
+            }
+            Transport::Http(h) => {
+                if h.closing.load(Ordering::SeqCst) {
+                    return Err(anyhow!(
+                        "MCP HTTP connection disconnected; request not sent"
+                    ));
+                }
+                let id = h.next_id.fetch_add(1, Ordering::SeqCst);
+                let started = std::time::Instant::now();
+                let tool = params
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                tracing::info!(target: "wisp", request_id=id, method, tool, "mcp.request.started");
+                let mut rb = h.post().json(&JsonRpcReq {
+                    jsonrpc: "2.0",
+                    id,
+                    method: method.into(),
+                    params,
+                });
+                let mut cancel = h.post().json(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id,"reason":"Caller stopped waiting; no rollback implied"}}));
+                if let Some(sid) = h.session_id.lock().await.clone() {
+                    rb = rb.header("mcp-session-id", &sid);
+                    cancel = cancel.header("mcp-session-id", sid);
+                }
+                let mut cancellation = HttpCancellation {
+                    request: (method != "initialize").then_some(cancel),
+                };
+                let work = async {
+                    let mut response = rb.send().await?;
+                    if let Some(sid) = response
+                        .headers()
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        *h.session_id.lock().await = Some(sid.to_owned());
+                    }
+                    let status = response.status();
+                    if !status.is_success() {
+                        h.closing.store(true, Ordering::SeqCst);
+                        return Err(anyhow!(
+                            "MCP HTTP status {status}; connection invalidated; no automatic replay"
+                        ));
+                    }
+                    let sse = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.contains("text/event-stream"));
+                    let mut decoder = SseDecoder::default();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response.chunk().await? {
+                        if sse {
+                            if let Some(result) = decoder.feed(&chunk, id)? {
+                                return Ok(result);
+                            }
+                        } else {
+                            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                                return Err(anyhow!("MCP response too large"));
+                            }
+                            bytes.extend_from_slice(&chunk);
+                        }
+                    }
+                    if sse {
+                        return Err(anyhow!("MCP SSE closed before response; operation outcome unknown, do not replay"));
+                    }
+                    rpc_result(serde_json::from_slice(&bytes)?, id)
+                };
+                let exchange = tokio::select! {
+                    result = work => result,
+                    _ = async { loop {
+                        if h.closing.load(Ordering::SeqCst) { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    } } => Err(anyhow!("MCP connection closed; operation outcome unknown, do not replay")),
+                };
+                if !h.closing.load(Ordering::SeqCst) {
+                    cancellation.request = None;
+                }
+                let exchange = exchange.map_err(|error| {
+                    if method == "tools/call" && error.downcast_ref::<RemoteRpcError>().is_none() {
+                        error.context("MCP HTTP operation outcome unknown; no automatic replay")
+                    } else {
+                        error
+                    }
+                });
+                if exchange
+                    .as_ref()
+                    .is_err_and(|e| e.downcast_ref::<RemoteRpcError>().is_none())
+                {
+                    h.closing.store(true, Ordering::SeqCst);
+                }
+                tracing::info!(target: "wisp", request_id=id, method, elapsed_ms=started.elapsed().as_millis() as u64, success=exchange.is_ok(), "mcp.request.finished");
+                exchange
             }
         }
     }
-
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         match &self.transport {
-            Transport::Stdio { stdin, .. } => {
-                let val = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-                let mut w = stdin.lock().await;
-                let w = w
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("MCP server stdin is closed"))?;
-                w.write_all(val.to_string().as_bytes()).await?;
-                w.write_all(b"\n").await?;
-                w.flush().await?;
-                Ok(())
+            Transport::Stdio { writer, .. } => {
+                let frame = format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","method":method,"params":params})
+                )
+                .into_bytes();
+                let (done, rx) = oneshot::channel();
+                tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, async {
+                    writer
+                        .send(StdioWrite {
+                            frame,
+                            request: None,
+                            done,
+                        })
+                        .await
+                        .map_err(|_| anyhow!("MCP writer closed"))?;
+                    rx.await.map_err(|_| anyhow!("MCP writer stopped"))?
+                })
+                .await
+                .map_err(|_| anyhow!("MCP notification timed out"))?
             }
             Transport::Http(h) => {
-                let val = json!({ "jsonrpc": "2.0", "method": method, "params": params });
                 let mut rb = h
-                    .client
-                    .post(&h.url)
-                    .header("content-type", "application/json")
-                    .header("accept", "application/json, text/event-stream")
-                    .json(&val);
+                    .post()
+                    .json(&json!({"jsonrpc":"2.0","method":method,"params":params}));
                 if let Some(sid) = h.session_id.lock().await.clone() {
                     rb = rb.header("mcp-session-id", sid);
                 }
-                for (k, v) in &h.headers {
-                    rb = rb.header(k.as_str(), v.as_str());
-                }
-                let _ = rb
+                rb.timeout(CONTROL_REQUEST_TIMEOUT)
                     .send()
-                    .await
-                    .map_err(|e| anyhow!("http mcp notify: {e}"))?;
+                    .await?
+                    .error_for_status()?;
                 Ok(())
             }
+            Transport::Managed(m) => Box::pin(m.ready().await?.notify(method, params)).await,
         }
     }
 
@@ -677,35 +894,10 @@ impl McpClient {
     /// `tools/call` preserving structured content, embedded resources, error
     /// state, and MCP Apps metadata for hosts that can render them.
     ///
-    /// Agent-originated: a stdio timeout or cancelled future tears down the
-    /// server process so a hung tool cannot block the next turn.
+    /// No execution deadline. Dropping the future cancels only this request.
     pub async fn tool_call_rich(&self, name: &str, arguments: &Value) -> Result<McpCallResult> {
-        self.tool_call_with(name, arguments, StdioCallPolicy::TeardownProcess)
-            .await
-    }
-
-    /// `tools/call` from an MCP App iframe. Timeout or cancel fails only this
-    /// JSON-RPC id; the shared stdio process stays up for sibling App calls
-    /// and the presenting agent connection.
-    pub async fn tool_call_rich_isolated(
-        &self,
-        name: &str,
-        arguments: &Value,
-    ) -> Result<McpCallResult> {
-        self.tool_call_with(name, arguments, StdioCallPolicy::IsolateCall)
-            .await
-    }
-
-    async fn tool_call_with(
-        &self,
-        name: &str,
-        arguments: &Value,
-        policy: StdioCallPolicy,
-    ) -> Result<McpCallResult> {
         let params = json!({ "name": name, "arguments": arguments });
-        let result = self
-            .request_with("tools/call", Some(params), policy)
-            .await?;
+        let result = self.request("tools/call", Some(params)).await?;
         let content = result
             .get("content")
             .and_then(|c| c.as_array())
@@ -720,6 +912,11 @@ impl McpClient {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         })
+    }
+
+    /// Compatibility alias; all callers now have isolated cancellation.
+    pub async fn tool_call_rich_isolated(&self, name: &str, args: &Value) -> Result<McpCallResult> {
+        self.tool_call_rich(name, args).await
     }
 
     /// Read one server resource, including MCP Apps `ui://` documents.
@@ -754,7 +951,18 @@ impl McpClient {
                 )
                 .await
             }
-            Transport::Http(_) => Ok(()),
+            Transport::Http(h) => {
+                h.closing.store(true, Ordering::SeqCst);
+                if let Some(sid) = h.session_id.lock().await.take() {
+                    let mut rb = h.client.delete(&h.url).header("mcp-session-id", sid);
+                    for (k, v) in &h.headers {
+                        rb = rb.header(k, v);
+                    }
+                    let _ = rb.timeout(STDIO_SHUTDOWN_LOCK_WAIT).send().await;
+                }
+                Ok(())
+            }
+            Transport::Managed(m) => m.shutdown().instrument(m.span()).await,
         }
     }
 }
@@ -781,39 +989,70 @@ fn fail_stdio_waiters(waiters: &StdioWaiters, message: impl Into<String>) {
     }
 }
 
-fn spawn_stdio_reader(stdout: tokio::process::ChildStdout, waiters: StdioWaiters) {
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => {
-                    fail_stdio_waiters(&waiters, "MCP server closed stdout");
-                    break;
-                }
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
+fn spawn_stdio_reader(
+    stdout: tokio::process::ChildStdout,
+    waiters: StdioWaiters,
+    closing: Arc<AtomicBool>,
+) {
+    tokio::spawn(
+        async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match (&mut reader)
+                    .take((MAX_RESPONSE_BYTES + 1) as u64)
+                    .read_line(&mut line)
+                    .await
+                {
+                    Ok(0) => {
+                        closing.store(true, Ordering::SeqCst);
+                        tracing::warn!(target: "wisp", "mcp.connection.disconnected: stdout EOF");
+                        fail_stdio_waiters(
+                            &waiters,
+                            "MCP server closed stdout; operation outcome unknown, do not replay",
+                        );
+                        break;
                     }
-                    let Ok(resp) = serde_json::from_str::<JsonRpcResp>(trimmed) else {
-                        tracing::warn!("ignoring malformed MCP stdio line");
-                        continue;
-                    };
-                    if let Some(id) = resp.id {
-                        if let Some(tx) = waiters.lock().unwrap().remove(&id) {
-                            let _ = tx.send(Ok(resp));
+                    Ok(_) => {
+                        if line.len() > MAX_RESPONSE_BYTES {
+                            closing.store(true, Ordering::SeqCst);
+                            fail_stdio_waiters(
+                                &waiters,
+                                "MCP response exceeded size limit; connection invalidated",
+                            );
+                            break;
+                        }
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let Ok(resp) = serde_json::from_str::<JsonRpcResp>(trimmed) else {
+                            tracing::warn!("ignoring malformed MCP stdio line");
+                            continue;
+                        };
+                        if let Some(id) = resp.id {
+                            if let Some(tx) = waiters.lock().unwrap().remove(&id) {
+                                let _ = tx.send(Ok(resp));
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    fail_stdio_waiters(&waiters, format!("MCP server stdout: {error}"));
-                    break;
+                    Err(error) => {
+                        closing.store(true, Ordering::SeqCst);
+                        tracing::warn!(target: "wisp", "mcp.connection.disconnected: read failure");
+                        fail_stdio_waiters(
+                            &waiters,
+                            format!(
+                            "MCP server stdout: {error}; operation outcome unknown, do not replay"
+                        ),
+                        );
+                        break;
+                    }
                 }
             }
         }
-    });
+        .instrument(tracing::Span::current()),
+    );
 }
 
 async fn shutdown_stdio(

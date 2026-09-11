@@ -52,6 +52,8 @@ pub(crate) use wisp_runs::harvest;
 mod image_generation_tool;
 mod library_commands;
 mod mcp_bridge;
+mod mcp_broker;
+mod mcp_connections;
 pub use mcp_bridge::run_mcp_bridge_cli;
 mod mcp_oauth;
 mod mcp_secrets;
@@ -2082,6 +2084,7 @@ const fn default_resume_last_session() -> bool {
 /// settings. A busy runtime remembers the invalidation until its current turn
 /// releases the agent lock; it must never silently lose a settings change.
 async fn clear_idle_agents(state: &AppState) {
+    mcp_connections::host().reconcile(&state.store, None).await;
     let runtimes = state
         .sessions
         .lock()
@@ -2106,6 +2109,9 @@ fn invalidate_idle_agents_owned(
 }
 
 async fn clear_idle_agents_for_project(state: &AppState, project_id: &str) {
+    mcp_connections::host()
+        .reconcile(&state.store, Some(project_id))
+        .await;
     let owned: HashSet<String> = match state.store.list_sessions(project_id).await {
         Ok(rows) => rows.into_iter().map(|(id, ..)| id).collect(),
         Err(_) => return,
@@ -2408,9 +2414,8 @@ const MAX_MCP_APP_ARGUMENT_BYTES: usize = 3 * 1024 * 1024;
 /// Hard ceiling on a single MCP App `tools/call` result JSON blob.
 const MAX_MCP_APP_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_APP_TOOL_NAME_BYTES: usize = 256;
-/// Host-side App `tools/call` ceiling, independent of the 120s transport
-/// timeout. Expiry fails this iframe call only; it does not tear down stdio.
-const MCP_APP_TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// No default execution limit. Explicit deadlines remain available to tests/embedders.
+const MCP_APP_TOOL_CALL_TIMEOUT: Option<std::time::Duration> = None;
 const MCP_APP_STALE_INSTANCE_ERROR: &str =
     "stale-instance: the MCP App is no longer bound to a live MCP server";
 
@@ -2418,8 +2423,11 @@ pub(crate) async fn invoke_mcp_app_server_tool(
     server: &dyn wisp_tools::McpAppServer,
     name: &str,
     arguments: &serde_json::Value,
-    timeout: std::time::Duration,
+    timeout: Option<std::time::Duration>,
 ) -> Result<serde_json::Value, String> {
+    let Some(timeout) = timeout else {
+        return server.call_tool(name, arguments).await;
+    };
     match tokio::time::timeout(timeout, server.call_tool(name, arguments)).await {
         Ok(result) => result,
         Err(_) => Err(format!(
@@ -2459,6 +2467,8 @@ async fn request_mcp_app_tool_confirmation(
     tool: &str,
     preview: String,
     grant: Option<ApprovalGrantKey>,
+    limiter: &McpAppCallLimiter,
+    epoch: u64,
 ) -> wisp_tools::ConfirmDecision {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let request = ConfirmRequest::new(frame_id, message, tool, preview);
@@ -2478,10 +2488,24 @@ async fn request_mcp_app_tool_confirmation(
         .insert(frame_id.to_string());
     state.device_hub.mark_needs_user(frame_id, Some(project_id));
     emit_confirm_request(app, &request, Some(project_id));
-    let decision = receive_confirm_decision(rx).await;
-    state.confirms.lock().unwrap().remove(frame_id);
-    state.awaiting_confirm.lock().unwrap().remove(frame_id);
-    state.device_hub.resolve_needs_user(frame_id);
+    let decision = tokio::select! {
+        decision = receive_confirm_decision(rx) => decision,
+        _ = limiter.cancelled(epoch) => wisp_tools::ConfirmDecision::Denied { feedback: None },
+    };
+    let owns_confirmation = {
+        let mut pending = state.confirms.lock().unwrap();
+        let owns = pending
+            .get(frame_id)
+            .is_none_or(|p| p.request.approval_id == request.approval_id);
+        if owns {
+            pending.remove(frame_id);
+        }
+        owns
+    };
+    if owns_confirmation {
+        state.awaiting_confirm.lock().unwrap().remove(frame_id);
+        state.device_hub.resolve_needs_user(frame_id);
+    }
     decision
 }
 
@@ -2554,6 +2578,7 @@ async fn call_mcp_app_tool_inner(
     if let Some(schema) = bridge.server.input_schema(&name) {
         wisp_mcp::validate_tool_arguments(&schema, &arguments)?;
     }
+    let epoch = bridge.limiter.cancel_epoch.load(Ordering::SeqCst);
     let _permit = bridge.limiter.try_acquire()?;
     let project_id = state
         .store
@@ -2637,6 +2662,8 @@ async fn call_mcp_app_tool_inner(
                 &name,
                 preview,
                 grant_key,
+                &bridge.limiter,
+                epoch,
             )
             .await;
             if !decision.approved() {
@@ -2667,14 +2694,14 @@ async fn call_mcp_app_tool_inner(
         started.elapsed().as_millis() as u64,
         "",
     );
-    match invoke_mcp_app_server_tool(
-        bridge.server.as_ref(),
-        &name,
-        &arguments,
-        MCP_APP_TOOL_CALL_TIMEOUT,
-    )
-    .await
-    {
+    if bridge.limiter.was_cancelled(epoch) {
+        return Err("MCP App was closed or cancelled; request not sent".into());
+    }
+    let outcome = tokio::select! {
+        result = invoke_mcp_app_server_tool(bridge.server.as_ref(), &name, &arguments, MCP_APP_TOOL_CALL_TIMEOUT) => result,
+        _ = bridge.limiter.cancelled(epoch) => Err("MCP wait cancelled; plugin kept alive. External operation outcome may be unknown; do not replay automatically.".into()),
+    };
+    match outcome {
         Ok(result) => {
             if let Some(child) = child {
                 mcp_app_child_commands::ensure_current(state, child)?;
@@ -3054,14 +3081,25 @@ impl Output for TauriOutput {
         payload: &serde_json::Value,
         server: Option<std::sync::Arc<dyn wisp_tools::McpAppServer>>,
     ) {
+        let mut payload = payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("_wispMcpBinding");
+        }
         let presentation_id = Uuid::new_v4().to_string();
         if kind == "mcp_app" && !payload.is_null() {
             if let Some(server) = server {
+                payload["_wispMcpBinding"] = serde_json::to_value(wisp_dto::McpAppBinding {
+                    version: 1,
+                    project_id: self.project_id.clone(),
+                    frame_id: self.frame_id.clone(),
+                    connector_id: server.connector_id().into(),
+                })
+                .unwrap_or_default();
                 // Same formula as ui/src/mcp_app.rs: resource URI (or tool
                 // name), not the unique presentation UUID, so a later Open/
                 // Search of the same app replaces the live bridge instead of
                 // stacking another center tab.
-                let instance_id = mcp_app_instance_id(&self.frame_id, payload);
+                let instance_id = mcp_app_instance_id(&self.frame_id, &payload);
                 self.app.state::<AppState>().register_mcp_app_bridge(
                     instance_id,
                     McpAppToolBridge {
@@ -5032,40 +5070,8 @@ async fn wire_runtimes_and_mcp(
 
     // Native bio domains obey connector settings and grants. The explicit
     // WISP_MCP_COMMAND override selects an external MCP server instead.
-    if let Ok(cmdline) = std::env::var("WISP_MCP_COMMAND") {
-        if connector_allow.is_some_and(|allow| !allow.contains("dev-mcp")) {
-            return finish_custom_mcp_wiring(result, registry, store, project_id, connector_allow)
-                .await;
-        }
-        let parts: Vec<String> = cmdline
-            .split_whitespace()
-            .map(|s| {
-                if s.ends_with(".py") {
-                    wisp_runtime::resolve_bundled_script(s)
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    s.to_string()
-                }
-            })
-            .collect();
-        if !parts.is_empty() {
-            let args: Vec<String> = parts[1..].to_vec();
-            match wisp_mcp::McpClient::launch(&parts[0], &args).await {
-                Ok(client) => match register_mcp(
-                    registry,
-                    std::sync::Arc::new(client),
-                    BUNDLED_DEV_MCP_CONNECTOR_ID,
-                )
-                .await
-                {
-                    Ok(names) => result.added_tools.extend(names),
-                    Err(error) => result.errors.push(error),
-                },
-                Err(e) => result.errors.push(format!("MCP command: {e}")),
-            }
-        }
-    } else {
+    // The explicit development server is registered by the same Host manager.
+    if std::env::var("WISP_MCP_COMMAND").is_err() {
         let pkg = std::env::var("WISP_MCP_PKG").unwrap_or_else(|_| "mcp_bio".into());
         let native_selected = wisp_bio::selected_by_package(&pkg);
         if native_selected {
@@ -5098,7 +5104,16 @@ async fn wire_runtimes_and_mcp(
         }
     }
 
-    finish_custom_mcp_wiring(result, registry, store, project_id, connector_allow).await
+    finish_custom_mcp_wiring(
+        result,
+        registry,
+        store,
+        project_id,
+        frame_id,
+        scope_key,
+        connector_allow,
+    )
+    .await
 }
 
 /// Host environment keys copied into a plugin MCP child after `env_clear()`.
@@ -5174,22 +5189,12 @@ async fn finish_custom_mcp_wiring(
     registry: &mut wisp_tools::Registry,
     store: &Store,
     project_id: &str,
+    frame_id: &str,
+    scope_key: &str,
     connector_allow: Option<&HashSet<String>>,
 ) -> ToolWiringResult {
-    // User-configured connections. Connect concurrently: each HTTP server has
-    // a 10s connect timeout, so a sequential loop could stall first-message
-    // startup by 10s per unreachable server (#67). Registration stays in
-    // config order so tool ordering is deterministic.
-    let conns: Vec<McpConnection> = load_mcp_connections(store)
-        .await
-        .into_iter()
-        .filter(|c| c.enabled)
-        .filter(|c| connector_allow.is_none_or(|allow| allow.contains(&c.id)))
-        .collect();
-    let mut set = tokio::task::JoinSet::new();
-    let (plugin_launches, plugin_errors) =
-        plugins::enabled_plugin_mcp_launches(store, project_id).await;
-    for error in plugin_errors {
+    let (specs, errors) = mcp_connections::configured(store, project_id).await;
+    for error in errors {
         result
             .plugin_runtime_checks
             .entry(error.plugin_id)
@@ -5197,31 +5202,24 @@ async fn finish_custom_mcp_wiring(
             .push(error.message.clone());
         result.errors.push(error.message);
     }
-    let mut next_index = 0usize;
-    for launch in plugin_launches
-        .into_iter()
-        .filter(|launch| connector_allow.is_none_or(|allow| allow.contains(&launch.connector_id)))
-    {
-        let plugin_id = launch.plugin_id.clone();
-        result
-            .plugin_runtime_checks
-            .entry(plugin_id.clone())
-            .or_default();
-        let index = next_index;
-        next_index += 1;
-        let connector_id = launch.connector_id.clone();
+    let mut set = tokio::task::JoinSet::new();
+    for (index, spec) in specs.into_iter().enumerate() {
+        if connector_allow.is_some_and(|allow| !allow.contains(spec.id())) {
+            continue;
+        }
+        let client = mcp_connections::host()
+            .acquire(store, project_id, frame_id, scope_key, &spec)
+            .await;
+        let connector_id = spec.id().to_string();
+        let name = spec.name().to_string();
+        let plugin_id = spec.plugin_id().map(str::to_string);
+        if let Some(id) = &plugin_id {
+            result.plugin_runtime_checks.entry(id.clone()).or_default();
+        }
         set.spawn(async move {
-            let name = launch.display_name.clone();
-            let res = connect_plugin_mcp(&launch).await;
-            (index, name, Some(plugin_id), connector_id, true, res)
-        });
-    }
-    for (i, conn) in conns.into_iter().enumerate() {
-        let index = next_index + i;
-        let connector_id = conn.id.clone();
-        set.spawn(async move {
-            let res = connect_mcp(&conn).await;
-            (index, conn.name, None, connector_id, false, res)
+            let res = client.tools_list().await.map(|_| client);
+            let approval = plugin_id.is_some();
+            (index, name, plugin_id, connector_id, approval, res)
         });
     }
     let mut results = Vec::new();
@@ -5233,27 +5231,24 @@ async fn finish_custom_mcp_wiring(
     results.sort_by_key(|(i, _, _, _, _, _)| *i);
     for (_, name, plugin_id, connector_id, require_approval, res) in results {
         match res {
-            Ok(client) => match register_mcp_with_approval(
-                registry,
-                std::sync::Arc::new(client),
-                &connector_id,
-                require_approval,
-            )
-            .await
-            {
-                Ok(names) => result.added_tools.extend(names),
-                Err(error) => {
-                    let message = format!("MCP '{name}': {error}");
-                    if let Some(plugin_id) = plugin_id {
-                        result
-                            .plugin_runtime_checks
-                            .entry(plugin_id)
-                            .or_default()
-                            .push(message.clone());
+            Ok(client) => {
+                match register_mcp_with_approval(registry, client, &connector_id, require_approval)
+                    .await
+                {
+                    Ok(names) => result.added_tools.extend(names),
+                    Err(error) => {
+                        let message = format!("MCP '{name}': {error}");
+                        if let Some(plugin_id) = plugin_id {
+                            result
+                                .plugin_runtime_checks
+                                .entry(plugin_id)
+                                .or_default()
+                                .push(message.clone());
+                        }
+                        result.errors.push(message);
                     }
-                    result.errors.push(message);
                 }
-            },
+            }
             Err(error) => {
                 let message = format!("MCP '{name}': {error}");
                 if let Some(plugin_id) = plugin_id {
@@ -5268,14 +5263,6 @@ async fn finish_custom_mcp_wiring(
         }
     }
     result
-}
-
-async fn register_mcp(
-    registry: &mut wisp_tools::Registry,
-    client: std::sync::Arc<wisp_mcp::McpClient>,
-    connector_id: &str,
-) -> Result<Vec<String>, String> {
-    register_mcp_with_approval(registry, client, connector_id, false).await
 }
 
 async fn register_mcp_with_approval(
@@ -5301,6 +5288,7 @@ async fn register_mcp_with_approval(
             }
             // Keep UI-only tools available to App bridges; model visibility is
             // checked below when adding tools to the agent registry.
+            client.mark_catalog_current();
             let catalog = std::sync::Arc::new(tools);
             let mut names = Vec::new();
             for t in catalog.iter() {
@@ -7235,6 +7223,8 @@ pub fn run() {
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             mcp_app_child_commands::mcp_app_host_info,
             mcp_app_child_commands::open_mcp_app_child,
+            mcp_connections::prepare_mcp_app,
+            mcp_connections::restart_session_mcp,
             mcp_app_child_commands::update_mcp_app_child_bounds,
             mcp_app_child_commands::mcp_app_child_bootstrap,
             mcp_app_child_commands::mcp_app_child_ready,
@@ -7628,6 +7618,8 @@ pub fn run() {
                 macos_exit_in_progress.store(true, Ordering::SeqCst);
             }
             if matches!(_event, tauri::RunEvent::Exit) {
+                mcp_broker::shutdown();
+                tauri::async_runtime::block_on(mcp_connections::host().shutdown_all());
                 let store = _app.state::<AppState>().store.clone();
                 match tauri::async_runtime::block_on(store.pause_method_searches_for_shutdown()) {
                     Ok(paused) if paused > 0 => {
