@@ -149,6 +149,7 @@ fn model_profile_contract() {
         supports_vision: true,
         use_for_vision: true,
         use_for_image_generation: false,
+        image_generation_capable: false,
         image_size: String::new(),
         image_quality: String::new(),
         image_aspect_ratio: String::new(),
@@ -178,6 +179,7 @@ fn model_profile_contract() {
     assert!(dto.supports_vision);
     assert!(dto.use_for_vision);
     assert!(!dto.use_for_image_generation);
+    assert!(!dto.image_generation_capable);
     assert!(dto.use_for_video_generation);
     assert_eq!(dto.video_duration_secs, Some(8));
     assert_eq!(dto.video_aspect_ratio.as_deref(), Some("9:16"));
@@ -192,6 +194,16 @@ fn model_profile_contract() {
     assert_eq!(wisp_dto::VIDEO_RESOLUTIONS.len(), 3);
     assert_eq!(wisp_dto::VIDEO_DURATION_MIN_SECS, 1);
     assert_eq!(wisp_dto::VIDEO_DURATION_MAX_SECS, 15);
+}
+
+#[test]
+fn custom_image_capability_survives_backend_to_ui_contract() {
+    let dto: wisp_dto::ModelProfile = serde_json::from_value(serde_json::json!({
+        "id":"image", "provider":"openai", "model":"vendor/custom-image",
+        "use_for_image_generation":false, "image_generation_capable":true
+    }))
+    .unwrap();
+    assert!(!dto.is_chat_model());
 }
 
 #[test]

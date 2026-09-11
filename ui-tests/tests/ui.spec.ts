@@ -8941,7 +8941,7 @@ for (const locale of ["en", "zh"]) {
     await expect(effort).toHaveAccessibleDescription(/.+/);
     const image = page.getByTestId("use-for-image-generation");
     const video = page.getByTestId("use-for-video-generation");
-    await expect(image).toHaveAccessibleDescription(/gpt-image-2/);
+    await expect(image).toHaveAccessibleDescription(/Custom model IDs/);
     await expect(video).toHaveAccessibleDescription(/grok-imagine-video/);
     for (const width of [1440, 640]) {
       await page.setViewportSize({ width, height: 1200 });
@@ -9751,6 +9751,41 @@ test("API access on xAI suggests grok chat and imagine image", async ({ page }) 
   await expect(page.getByTestId("provider-model-row").nth(1).getByLabel("Model ID")).toHaveValue("grok-imagine-image-2.0");
   await expect(page.getByTestId("provider-model-row").nth(1).getByTestId("provider-use-for-image")).toBeChecked();
 });
+
+for (const modelId of ["gpt-image-2.5", "gateway/custom-image-v3"]) {
+  test(`custom image model ${modelId} validates with image intent and stays out of chat`, async ({ page }) => {
+    await enterApp(page);
+    await openSettingsSection(page, "Models");
+    await page.locator(".settings-list-row", { hasText: "opus-4.8" }).click();
+    await providerSelect(page).selectOption("openai");
+    await page.getByLabel("Model").fill(modelId);
+    await page.getByTestId("use-for-image-generation").check();
+    await expect(page.getByLabel("Max output tokens")).toHaveCount(0);
+    await expect(page.getByTestId("image-size")).toBeVisible();
+    await page.getByTestId("image-size").selectOption("1536x1024");
+    await page.getByRole("button", { name: "Valid" }).click();
+    await expect.poll(() => lastInvokeArgs(page, "validate_settings")).toMatchObject({
+      useForImageGeneration: true,
+      settings: { provider: "openai", model: modelId, supports_vision: false },
+    });
+    await expect(page.locator(".settings-status")).toHaveText(`Validated openai with ${modelId}`);
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect.poll(() => lastInvokeArgs(page, "save_model")).toMatchObject({
+      useForImageGeneration: true,
+      profile: { model: modelId, image_size: "1536x1024" },
+    });
+    const row = page.locator(".settings-list-row", { hasText: "opus-4.8" });
+    await expect(row.getByRole("button", { name: "Set as default" })).toHaveCount(0);
+    await row.click();
+    await page.getByTestId("use-for-image-generation").uncheck();
+    await expect(page.getByTestId("image-size")).toBeVisible();
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(row.getByRole("button", { name: "Set as default" })).toHaveCount(0);
+    await page.locator(".settings-head-close").click();
+    await page.locator(".model-picker-btn").click();
+    await expect(page.locator(".model-menu")).not.toContainText(modelId);
+  });
+}
 
 test("gpt-image-2 can be assigned for generation but not selected for chat", async ({ page }) => {
   await enterApp(page);

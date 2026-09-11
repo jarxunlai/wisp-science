@@ -848,6 +848,9 @@ fn apply_catalog_limits(
     let Some(current) = model_form.get() else {
         return;
     };
+    if current.is_image_model() {
+        return;
+    }
     let (provider, api_url, model) = (
         current.provider,
         join_api_url(&current.api_url, &current.endpoint_suffix),
@@ -3255,6 +3258,7 @@ pub(super) fn SettingsView(
                                                 on:input=move |ev| {
                                                     model_form.update(|o| if let Some(o)=o {
                                                         o.model = event_target_input(&ev).value();
+                                                        o.image_generation_capable = false;
                                                         if is_image_generation_model(&o.model) {
                                                             o.supports_vision = false;
                                                             o.use_for_vision = false;
@@ -3281,7 +3285,7 @@ pub(super) fn SettingsView(
                                                 placeholder=move || t(locale.get(), "settings.label_ph")
                                                 on:input=move |ev| model_form.update(|o| if let Some(o)=o { o.label = event_target_input(&ev).value(); }) /></label>
                                         {move || {
-                                            let image = model_form.get().is_some_and(|f| is_image_generation_model(&f.model));
+                                            let image = model_form.get().is_some_and(|f| f.is_image_model());
                                             // A model id is never both image and video, but keep the
                                             // branches mutually exclusive anyway.
                                             let video = !image && model_form.get().is_some_and(|f| is_video_generation_model(&f.model));
@@ -3428,6 +3432,11 @@ pub(super) fn SettingsView(
                                                             prop:checked=move || model_form.get().map(|f| f.use_for_image_generation).unwrap_or(false)
                                                             on:change=move|ev| model_form.update(|o| if let Some(o)=o {
                                                                 o.use_for_image_generation = event_target_checked(&ev);
+                                                                if o.use_for_image_generation {
+                                                                    o.use_for_vision = false;
+                                                                    o.supports_vision = false;
+                                                                    o.use_for_video_generation = false;
+                                                                }
                                                             }) />
                                                         <span>{move || t(locale.get(), "settings.use_for_image_generation")}</span>
                                                     </label>
@@ -3581,6 +3590,11 @@ pub(super) fn SettingsView(
                                                     prop:checked=move || model_form.get().map(|f| f.use_for_image_generation).unwrap_or(false)
                                                     on:change=move|ev| model_form.update(|o| if let Some(o)=o {
                                                         o.use_for_image_generation = event_target_checked(&ev);
+                                                        if o.use_for_image_generation {
+                                                            o.use_for_vision = false;
+                                                            o.supports_vision = false;
+                                                            o.use_for_video_generation = false;
+                                                        }
                                                     }) />
                                                 <span>{move || t(locale.get(), "settings.use_for_image_generation")}</span>
                                             </label>

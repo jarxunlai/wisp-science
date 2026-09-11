@@ -192,7 +192,7 @@ impl ModelSettingsState {
         // A catalog-known chat model has a documented output ceiling; saving a
         // larger max_tokens only ever surfaces as a provider 400 mid-turn.
         // Image and video models do not take token limits.
-        if !is_image_generation_model(&form.model) && !is_video_generation_model(&form.model) {
+        if !form.is_image_model() && !is_video_generation_model(&form.model) {
             if let Some(dto) = model_catalog_limits.get() {
                 if form.max_tokens > dto.max_tokens {
                     let text = tf(
@@ -495,7 +495,8 @@ impl ModelSettingsState {
         // The backend probes with a test image when "supports images" is on,
         // so both outcomes say which probe ran — a checked box was never
         // proof that the model takes images.
-        let vision = cfg.supports_vision;
+        let image = form.is_image_model();
+        let vision = cfg.supports_vision && !image;
         spawn_local(async move {
             let res = invoke_timeout(
                 "validate_settings",
@@ -503,6 +504,7 @@ impl ModelSettingsState {
                     "settings": cfg,
                     "key": key,
                     "profileId": profile_id,
+                    "useForImageGeneration": image,
                 }))
                 .unwrap(),
                 35_000,
