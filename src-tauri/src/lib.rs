@@ -2594,6 +2594,52 @@ pub(crate) fn emit_to_session_surfaces_filtered<T: Clone + Serialize>(
     }
 }
 
+/// Keep the model's live state and the composer's notice in sync on both the
+/// legacy iframe and isolated Windows request paths. A clear is also valid
+/// after its runtime has been released; attaching requires a live runtime.
+pub(crate) fn apply_mcp_app_context_update(
+    runtime: Option<&SessionRuntime>,
+    instance_id: String,
+    app_name: String,
+    context: Option<McpAppContext>,
+) -> Result<AgentEvent, String> {
+    let frame_id = mcp_app_frame_id(&instance_id)?.to_string();
+    if context.is_some() && runtime.is_none() {
+        return Err("MCP App context requires a session runtime.".into());
+    }
+    let (update_mode, state, summary, structured_preview) = match context.as_ref() {
+        Some(context) => (
+            "replace",
+            "active",
+            context
+                .summary
+                .chars()
+                .take(MAX_MCP_APP_NOTICE_TEXT_BYTES)
+                .collect(),
+            context.structured_preview.as_ref().map(|value| {
+                value
+                    .chars()
+                    .take(MAX_MCP_APP_NOTICE_STRUCTURED_BYTES)
+                    .collect()
+            }),
+        ),
+        None => ("clear", "cleared", String::new(), None),
+    };
+    if let Some(runtime) = runtime {
+        runtime.set_mcp_app_context(instance_id.clone(), context);
+    }
+    Ok(AgentEvent::AppContextUpdate {
+        frame_id,
+        context_id: instance_id.clone(),
+        instance_id,
+        app_name,
+        update_mode: update_mode.into(),
+        state: state.into(),
+        summary,
+        structured_preview,
+    })
+}
+
 #[tauri::command]
 async fn update_mcp_app_context(
     app: AppHandle,
@@ -2605,26 +2651,9 @@ async fn update_mcp_app_context(
     let frame_id = mcp_app_frame_id(&instance_id)?.to_string();
     let context = normalize_mcp_app_context(&app_name, context)?;
     if context.is_none() {
-        if let Some(runtime) = state.sessions.lock().await.get(&frame_id).cloned() {
-            runtime.set_mcp_app_context(instance_id.clone(), None);
-        }
-        persist_and_emit_app_context_update(
-            state.inner(),
-            &app,
-            &frame_id,
-            None,
-            AgentEvent::AppContextUpdate {
-                frame_id: frame_id.clone(),
-                context_id: instance_id.clone(),
-                instance_id,
-                app_name,
-                update_mode: "clear".into(),
-                state: "cleared".into(),
-                summary: String::new(),
-                structured_preview: None,
-            },
-        )
-        .await;
+        let runtime = state.sessions.lock().await.get(&frame_id).cloned();
+        let event = apply_mcp_app_context_update(runtime.as_deref(), instance_id, app_name, None)?;
+        persist_and_emit_app_context_update(state.inner(), &app, &frame_id, None, event).await;
         return Ok(());
     }
     let project_id = state
@@ -2645,34 +2674,13 @@ async fn update_mcp_app_context(
     if runtime.deleted.load(Ordering::SeqCst) {
         return Err("MCP App session was deleted.".into());
     }
-    let context = context.expect("non-empty MCP App context");
-    let summary = context
-        .summary
-        .chars()
-        .take(MAX_MCP_APP_NOTICE_TEXT_BYTES)
-        .collect::<String>();
-    let structured_preview = context.structured_preview.as_ref().map(|value| {
-        value
-            .chars()
-            .take(MAX_MCP_APP_NOTICE_STRUCTURED_BYTES)
-            .collect::<String>()
-    });
-    runtime.set_mcp_app_context(instance_id.clone(), Some(context));
+    let event = apply_mcp_app_context_update(Some(&runtime), instance_id, app_name, context)?;
     persist_and_emit_app_context_update(
         state.inner(),
         &app,
         &frame_id,
         project_id.as_deref(),
-        AgentEvent::AppContextUpdate {
-            frame_id: frame_id.clone(),
-            context_id: instance_id.clone(),
-            instance_id,
-            app_name,
-            update_mode: "replace".into(),
-            state: "active".into(),
-            summary,
-            structured_preview,
-        },
+        event,
     )
     .await;
     Ok(())

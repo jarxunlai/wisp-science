@@ -478,6 +478,144 @@ fn mcp_app_context_is_latest_only_and_session_scoped() {
 }
 
 #[test]
+fn mcp_app_context_update_keeps_live_state_and_composer_event_together() {
+    let runtime = SessionRuntime::new();
+    let other = SessionRuntime::new();
+    let instance = "mcp-app:session-a:ui://figures/view";
+    for text in ["First selected figure", "Replacement selected figure"] {
+        let context = super::normalize_mcp_app_context(
+            "Scientific Figure Library",
+            serde_json::json!({
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": {"templateId": "selected", "apiKey": "hidden"}
+            }),
+        )
+        .unwrap();
+        let event = super::apply_mcp_app_context_update(
+            Some(&runtime),
+            instance.into(),
+            "Scientific Figure Library".into(),
+            context,
+        )
+        .unwrap();
+        let AgentEvent::AppContextUpdate {
+            frame_id,
+            context_id,
+            instance_id,
+            app_name,
+            update_mode,
+            state,
+            summary,
+            structured_preview,
+        } = event
+        else {
+            panic!("context must produce a composer event, not a turn event");
+        };
+        assert_eq!(frame_id, "session-a");
+        assert_eq!(context_id, instance);
+        assert_eq!(instance_id, instance);
+        assert_eq!(app_name, "Scientific Figure Library");
+        assert_eq!(update_mode, "replace");
+        assert_eq!(state, "active");
+        assert_eq!(summary, text);
+        assert!(!structured_preview.unwrap().contains("hidden"));
+        assert!(runtime.mcp_app_context_injection().unwrap().contains(text));
+        assert!(other.mcp_app_context_injection().is_none());
+        assert!(super::should_persist_ui_event(
+            &AgentEvent::AppContextUpdate {
+                frame_id,
+                context_id,
+                instance_id,
+                app_name,
+                update_mode,
+                state,
+                summary,
+                structured_preview: None,
+            }
+        ));
+    }
+    assert!(!runtime
+        .mcp_app_context_injection()
+        .unwrap()
+        .contains("First selected figure"));
+    let event = super::apply_mcp_app_context_update(
+        Some(&runtime),
+        instance.into(),
+        "Scientific Figure Library".into(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(event, AgentEvent::AppContextUpdate {
+        state, update_mode, summary, structured_preview: None, ..
+    } if state == "cleared" && update_mode == "clear" && summary.is_empty()));
+    assert!(runtime.mcp_app_context_injection().is_none());
+}
+
+#[test]
+fn mcp_app_context_update_handles_released_runtime_and_invalid_identity() {
+    let instance = "mcp-app:session-a:ui://figures/view";
+    assert!(matches!(super::apply_mcp_app_context_update(
+        None, instance.into(), "Figures".into(), None,
+    ).unwrap(), AgentEvent::AppContextUpdate { state, .. } if state == "cleared"));
+    let runtime = SessionRuntime::new();
+    let context = || {
+        super::normalize_mcp_app_context(
+            "Figures",
+            serde_json::json!({"content": [{"type": "text", "text": "selected"}]}),
+        )
+        .unwrap()
+    };
+    assert!(super::apply_mcp_app_context_update(
+        None,
+        instance.into(),
+        "Figures".into(),
+        context()
+    )
+    .is_err());
+    assert!(super::apply_mcp_app_context_update(
+        Some(&runtime),
+        "invalid".into(),
+        "Figures".into(),
+        context()
+    )
+    .is_err());
+    assert!(runtime.mcp_app_context_injection().is_none());
+}
+
+#[test]
+fn mcp_app_context_update_bounds_notice_without_truncating_model_state() {
+    let runtime = SessionRuntime::new();
+    let text = "a".repeat(super::MAX_MCP_APP_NOTICE_TEXT_BYTES + 100);
+    let context = super::normalize_mcp_app_context(
+        "Figures", serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": {"selection": "b".repeat(super::MAX_MCP_APP_NOTICE_STRUCTURED_BYTES + 100)}
+        }),
+    ).unwrap();
+    let event = super::apply_mcp_app_context_update(
+        Some(&runtime),
+        "mcp-app:session-a:figures".into(),
+        "Figures".into(),
+        context,
+    )
+    .unwrap();
+    let AgentEvent::AppContextUpdate {
+        summary,
+        structured_preview,
+        ..
+    } = event
+    else {
+        panic!();
+    };
+    assert_eq!(summary.len(), super::MAX_MCP_APP_NOTICE_TEXT_BYTES);
+    assert_eq!(
+        structured_preview.unwrap().len(),
+        super::MAX_MCP_APP_NOTICE_STRUCTURED_BYTES
+    );
+    assert!(runtime.mcp_app_context_injection().unwrap().contains(&text));
+}
+
+#[test]
 fn mcp_app_context_notice_projects_text_and_structured_preview() {
     let context = super::normalize_mcp_app_context(
         "  Motif   for   Claude  ",

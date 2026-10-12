@@ -3762,7 +3762,11 @@ fn App() -> impl IntoView {
                     return;
                 }
                 if state == "cleared" {
-                    mcp_app_context.set(None);
+                    mcp_app_context.update(|current| {
+                        if current.as_ref().is_some_and(|notice| notice.context_id == context_id) {
+                            *current = None;
+                        }
+                    });
                 } else {
                     mcp_app_context.set(Some(AppContextNotice {
                         context_id,

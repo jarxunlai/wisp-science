@@ -67,17 +67,40 @@ fn finish_retirement(app: &AppHandle, retired: Retirement) {
             let Some(state) = app.try_state::<AppState>() else {
                 return;
             };
-            let sessions = state.sessions.lock().await;
-            let Some(children) = app.try_state::<McpAppChildren>() else {
-                return;
-            };
-            let registry = children.registry.lock().unwrap();
-            if !registry.has_binding(&instance) && state.mcp_app_bridge(&instance).is_none() {
-                if let Ok(frame) = mcp_app_frame_id(&instance) {
-                    if let Some(runtime) = sessions.get(frame) {
-                        runtime.set_mcp_app_context(instance.clone(), None);
-                    }
+            let update = {
+                let sessions = state.sessions.lock().await;
+                let Some(children) = app.try_state::<McpAppChildren>() else {
+                    return;
+                };
+                let registry = children.registry.lock().unwrap();
+                if !registry.has_binding(&instance) && state.mcp_app_bridge(&instance).is_none() {
+                    mcp_app_frame_id(&instance).ok().and_then(|frame| {
+                        let runtime = sessions.get(frame)?;
+                        // Do not clear an unrelated composer's attachment when
+                        // closing an App that never submitted live context.
+                        if !runtime
+                            .mcp_app_contexts
+                            .lock()
+                            .unwrap()
+                            .contains_key(&instance)
+                        {
+                            return None;
+                        }
+                        crate::apply_mcp_app_context_update(
+                            Some(runtime),
+                            instance.clone(),
+                            "MCP App".into(),
+                            None,
+                        )
+                        .ok()
+                        .map(|event| (frame.to_string(), event))
+                    })
+                } else {
+                    None
                 }
+            };
+            if let Some((frame, event)) = update {
+                crate::persist_and_emit_app_context_update(&state, &app, &frame, None, event).await;
             }
         });
     }
@@ -398,24 +421,40 @@ pub(crate) async fn mcp_app_child_request(
                 .unwrap_or("MCP App");
             let context = crate::normalize_mcp_app_context(title, request.params)?;
             let frame = mcp_app_frame_id(&child.instance_id)?.to_string();
-            if state
+            let project_id = state
                 .store
                 .frame_project_id(&frame)
                 .await
-                .map_err(|e| e.to_string())?
-                .is_none()
-            {
+                .map_err(|e| e.to_string())?;
+            if project_id.is_none() {
                 return Err(STALE.into());
             }
-            let mut sessions = state.sessions.lock().await;
-            ensure_current(&state, &child)?;
-            let runtime = sessions
-                .entry(frame)
-                .or_insert_with(|| std::sync::Arc::new(crate::SessionRuntime::new()));
-            if runtime.deleted.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(STALE.into());
-            }
-            runtime.set_mcp_app_context(child.instance_id.clone(), context);
+            let event = {
+                let mut sessions = state.sessions.lock().await;
+                ensure_current(&state, &child)?;
+                let runtime = sessions
+                    .entry(frame.clone())
+                    .or_insert_with(|| std::sync::Arc::new(crate::SessionRuntime::new()));
+                if runtime.deleted.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(STALE.into());
+                }
+                crate::apply_mcp_app_context_update(
+                    Some(runtime),
+                    child.instance_id.clone(),
+                    title.to_string(),
+                    context,
+                )?
+            };
+            // Do not acknowledge a successful update without notifying the
+            // primary composer. No Agent turn is started by this UI event.
+            crate::persist_and_emit_app_context_update(
+                &state,
+                &app,
+                &frame,
+                project_id.as_deref(),
+                event,
+            )
+            .await;
             json!({})
         }
         "ui/notifications/initialized" => json!({}),

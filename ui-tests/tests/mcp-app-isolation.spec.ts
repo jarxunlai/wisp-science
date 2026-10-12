@@ -180,6 +180,93 @@ test("child shell preserves sandbox/CSP and directly forwards guest protocol", a
   await page.waitForTimeout(50);
   expect(await page.evaluate(() => (window as any).__shellCalls.filter((c:any)=>c.command==="mcp_app_child_request").length)).toBe(2);
 });
+
+test("child shell forwards context attach, replacement and clear before acknowledging", async ({page}) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.__contextRequests = [];
+    w.__TAURI_INTERNALS__ = { invoke: async (command: string, args: any = {}) => {
+      if (command === "mcp_app_child_bootstrap") return {
+        handle: {}, instanceId: "mcp-app:fake:ui://figures/view", version: "test",
+        hostContext: {}, payload: { tool: {name: "figures", title: "Figures"},
+          resource: {text: `<!doctype html><body><button id="attach">Attach</button><button id="replace">Replace</button><button id="clear">Clear</button><div id="ack">waiting</div><script>
+          let id = 1;
+          const send = params => parent.postMessage({jsonrpc:'2.0',method:'ui/update-model-context',id:id++,params},'*');
+          document.querySelector('#attach').onclick = () => send({content:[{type:'text',text:'Selected figure A'}],structuredContent:{templateId:'A'}});
+          document.querySelector('#replace').onclick = () => send({content:[{type:'text',text:'Selected figure B'}]});
+          document.querySelector('#clear').onclick = () => send({});
+          addEventListener('message', e => {if(e.data.result)document.querySelector('#ack').textContent='ack:'+e.data.id;});
+          <\/script>`}, result: {content: []} }
+      };
+      if (command === "mcp_app_child_request") {
+        w.__contextRequests.push(args.request);
+        return {jsonrpc: "2.0", id: args.request.id, result: {}};
+      }
+      return {};
+    }};
+  });
+  await page.goto("/mcp-app/shell.html");
+  const guest = page.frameLocator("iframe");
+  await guest.getByRole("button", {name:"Attach", exact:true}).click();
+  await expect(guest.locator("#ack")).toHaveText("ack:1");
+  await guest.getByRole("button", {name:"Replace", exact:true}).click();
+  await expect(guest.locator("#ack")).toHaveText("ack:2");
+  await guest.getByRole("button", {name:"Clear", exact:true}).click();
+  await expect(guest.locator("#ack")).toHaveText("ack:3");
+  expect(await page.evaluate(() => (window as any).__contextRequests)).toEqual([
+    {id:1, method:"ui/update-model-context", params:{content:[{type:"text",text:"Selected figure A"}],structuredContent:{templateId:"A"}}},
+    {id:2, method:"ui/update-model-context", params:{content:[{type:"text",text:"Selected figure B"}]}},
+    {id:3, method:"ui/update-model-context", params:{}},
+  ]);
+});
+
+test("native composer displays context without starting a turn and clears on removal or final close", async ({page}) => {
+  const frame = await start(page);
+  await present(page, frame);
+  await expect.poll(() => calls(page,"open_mcp_app_child")).toHaveLength(1);
+  await page.evaluate(frame => {
+    const w = window as any, original = w.__TAURI__.core.invoke;
+    const instance = `mcp-app:${frame}:ui://figures/view`;
+    const notice = (summary: string, cleared: boolean, frameId = frame) => w.__tauriEmit("agent", {
+      kind:"AppContextUpdate",frame_id:frameId,context_id:instance,instance_id:instance,
+      app_name:"Isolated figures",update_mode:cleared?"clear":"replace",state:cleared?"cleared":"active",
+      summary,structured_preview:null,
+    });
+    w.__submitNativeContext = (text: string, frameId = frame) => notice(text, false, frameId);
+    w.__clearOtherNativeContext = () => w.__tauriEmit("agent", {
+      kind:"AppContextUpdate",frame_id:frame,context_id:`mcp-app:${frame}:ui://other/view`,
+      instance_id:`mcp-app:${frame}:ui://other/view`,app_name:"Other App",
+      update_mode:"clear",state:"cleared",summary:"",structured_preview:null,
+    });
+    w.__TAURI__.core.invoke = async (command: string, args: any = {}) => {
+      const result = await original(command, args);
+      if ((command === "update_mcp_app_context" && args.context && Object.keys(args.context).length === 0)
+        || (command === "close_mcp_app_child" && args.reason === "user_close")) notice("", true);
+      return result;
+    };
+  }, frame);
+  const turns = () => page.evaluate(() => (window as any).__skillInvokeLog.filter((c:any)=>c.cmd==="send_message").length);
+  const before = await turns();
+  const attachment = page.getByTestId("mcp-app-context-attachment");
+  await page.evaluate(() => (window as any).__submitNativeContext("Selected figure A", "other-session"));
+  await expect(attachment).toHaveCount(0);
+  await page.evaluate(() => (window as any).__submitNativeContext("Selected figure A"));
+  await expect(attachment).toContainText("MCP App context");
+  await expect(attachment.locator(".composer-reference-card")).toHaveAttribute("title","Selected figure A");
+  await page.evaluate(() => (window as any).__submitNativeContext("Selected figure B"));
+  await expect(attachment).toHaveCount(1);
+  await expect(attachment.locator(".composer-reference-card")).toHaveAttribute("title","Selected figure B");
+  await page.evaluate(() => (window as any).__clearOtherNativeContext());
+  await expect(attachment).toHaveCount(1);
+  await expect(attachment.locator(".composer-reference-card")).toHaveAttribute("title","Selected figure B");
+  await attachment.getByRole("button", {name:"Remove attachment"}).click();
+  await expect(attachment).toHaveCount(0);
+  await page.evaluate(() => (window as any).__submitNativeContext("Selected figure C"));
+  await expect(attachment).toHaveCount(1);
+  await page.locator('.center-tab[data-center-path^="mcp-app:"]').locator("..").locator(".center-tab-close").click();
+  await expect(attachment).toHaveCount(0);
+  expect(await turns()).toBe(before);
+});
 test("restored App binds fresh resources without replaying a tool call", async ({page}) => {
   const frame = await start(page);
   await page.evaluate(() => {

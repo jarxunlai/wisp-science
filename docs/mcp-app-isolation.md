@@ -56,6 +56,32 @@ the active tab; old close operations cannot revoke a newer bridge generation.
 Logical references survive suspension and are counted across windows. Final
 user close releases only the corresponding logical binding/context/bridge.
 
+## App-to-Agent context handoff
+
+An App's standard `ui/update-model-context` request updates live state for the
+next conversation turn; it does **not** start an Agent turn. Both the Windows
+child request path and the legacy iframe path publish the same persisted
+`AppContextUpdate` notice to the primary composer. The composer shows a
+removable **MCP App context** attachment, not a chat transcript row. Repeated
+updates replace the selection; an empty update or removal clears the live
+context and its attachment. Final native App close also publishes a clear
+notice when it releases the context; suspension retains the logical binding.
+
+This is a Host contract, not a Scientific Figure Library special case. For
+example, after selecting figures and clicking **交给 Agent**, a successful
+App acknowledgement should be accompanied by a context attachment in the
+same conversation. An acknowledgement alone must not leave model-visible
+state hidden from the composer. Child identity, current session, bridge
+generation and payload validation still apply before any update is accepted.
+
+Windows manual smoke: open an MCP App in a disposable project, submit a
+selection, verify the attachment appears without a new Agent turn, submit a
+replacement, remove the attachment, and verify the next turn no longer uses
+that selection. Submit again and close the App's tab; the attachment must
+clear. Repeat with a second conversation to check session isolation. These
+manual checks require a native desktop; mocked browser tests do not prove
+WebView2 integration.
+
 No registry lock is held while constructing or destroying native WebViews.
 `add_child` and native hide/close share `native_ops` so a retired label cannot
 be created after close. Construction uses `spawn_blocking` and does not hold
