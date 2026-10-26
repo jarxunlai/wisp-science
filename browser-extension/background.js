@@ -67,8 +67,30 @@ function send(message) {
   }
 }
 
+var browserInstancePromise = null;
+
+// One id per browser run, kept in session storage so service worker restarts
+// share it. Wisp drops tab ownership when it changes, because a restarted
+// Chrome hands out tab ids from scratch.
+function browserInstanceId() {
+  if (!browserInstancePromise) {
+    browserInstancePromise = (async function () {
+      try {
+        var stored = await chrome.storage.session.get(["wisp_browser_instance"]);
+        if (stored.wisp_browser_instance) return stored.wisp_browser_instance;
+        var created = crypto.randomUUID();
+        await chrome.storage.session.set({ wisp_browser_instance: created });
+        return created;
+      } catch (_) {
+        return "";
+      }
+    })();
+  }
+  return browserInstancePromise;
+}
+
 async function sendHandshake() {
-  send(handshakePayload(await browserTabs(), paused));
+  send(handshakePayload(await browserTabs(), paused, await browserInstanceId()));
 }
 
 // Drop a socket that still says OPEN but has not heard from Wisp in
@@ -325,7 +347,10 @@ async function runCommand(tabId, command) {
       return await runWithCdp(command.tabId || tabId, command.method, command.params || {});
     case "tabs": {
       if (command.method === "create") {
-        return await tabOps.create(command.url, command.active);
+        return await tabOps.create(command.url, command.active, {
+          windowId: command.windowId,
+          newWindow: !!command.newWindow
+        });
       }
       if (command.method === "close") {
         var ids = (command.tabIds || [command.tabId || tabId]).filter(function (id) { return Number.isInteger(id); });
@@ -456,7 +481,16 @@ async function handleRequest(request) {
     var newTabs = [];
     for (var createdId of created) {
       var createdTab = await tabSnapshot(createdId);
-      if (createdTab) newTabs.push({ id: createdTab.id, url: createdTab.url, title: createdTab.title });
+      // openerTabId lets Wisp adopt only the popups the operated tab opened.
+      if (createdTab) {
+        newTabs.push({
+          id: createdTab.id,
+          url: createdTab.url,
+          title: createdTab.title,
+          windowId: createdTab.windowId,
+          openerTabId: createdTab.openerTabId
+        });
+      }
     }
     send({
       type: "result",

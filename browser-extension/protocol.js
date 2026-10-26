@@ -1,7 +1,7 @@
 // Wisp Real Browser Bridge protocol constants (Protocol v2).
 var WISP_PROTOCOL = {
   version: 2,
-  extensionVersion: "0.4.2",
+  extensionVersion: "0.4.3",
   capabilities: [
     "article_scan",
     "asset_download",
@@ -14,7 +14,8 @@ var WISP_PROTOCOL = {
     "runtime_reload",
     "chatgpt_turn",
     "chat_turn",
-    "side_panel"
+    "side_panel",
+    "window_binding"
   ]
 };
 
@@ -30,7 +31,9 @@ function readBridgeConfig() {
   return { session: session, endpoint: endpoint };
 }
 
-function handshakePayload(tabs, paused) {
+// browserInstance survives service worker restarts but not a browser restart,
+// so Wisp can tell when Chrome has started tab ids over.
+function handshakePayload(tabs, paused, browserInstance) {
   var cfg = readBridgeConfig();
   return {
     type: "ext_ready",
@@ -40,6 +43,7 @@ function handshakePayload(tabs, paused) {
     session: cfg.session,
     endpoint: cfg.endpoint,
     paused: !!paused,
+    browser_instance: browserInstance || "",
     tabs: tabs || []
   };
 }

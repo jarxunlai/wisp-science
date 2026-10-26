@@ -39,6 +39,9 @@ function fakeChrome(openWindows) {
     tabs: {
       async create(props) {
         calls.tabsCreate.push({ ...props });
+        if (props.windowId !== undefined && !windows.includes(props.windowId)) {
+          throw new Error(`No window with id: ${props.windowId}.`);
+        }
         const windowId = props.windowId ?? windows.at(-1);
         if (windowId === undefined) throw new Error("No current window");
         return { id: nextTab++, url: "", status: "loading", active: !!props.active, windowId };
@@ -108,4 +111,56 @@ test("other tab errors do not open a window", async () => {
   const ops = root.createTabOps(chrome);
   await assert.rejects(ops.create("https://example.com", false), (error) => error.code === "TAB_ERROR");
   assert.deepEqual(chrome.calls.windowsCreate, []);
+});
+
+test("create opens in the bound window even when another window is current", async () => {
+  const chrome = fakeChrome(2);
+  const ops = root.createTabOps(chrome);
+  const tab = await ops.create("https://example.com", false, { windowId: 1 });
+  assert.deepEqual(chrome.calls.tabsCreate, [{ windowId: 1, url: "https://example.com", active: false }]);
+  assert.deepEqual(chrome.calls.windowsCreate, []);
+  assert.equal(tab.windowId, 1);
+  assert.equal(ops.isManaged(tab.id), true);
+});
+
+test("newWindow opens an unfocused dedicated window and reports its id", async () => {
+  const chrome = fakeChrome(1);
+  const ops = root.createTabOps(chrome);
+  const tab = await ops.create("https://example.com", false, { newWindow: true });
+  assert.deepEqual(chrome.calls.tabsCreate, []);
+  assert.deepEqual(chrome.calls.windowsCreate, [{ url: "https://example.com", focused: false }]);
+  assert.equal(tab.windowId, 2);
+  assert.equal(ops.isManaged(tab.id), true);
+});
+
+test("newWindow takes focus only for an active tab", async () => {
+  const chrome = fakeChrome(1);
+  const ops = root.createTabOps(chrome);
+  await ops.create("https://example.com", true, { newWindow: true });
+  assert.deepEqual(chrome.calls.windowsCreate, [{ url: "https://example.com", focused: true }]);
+});
+
+test("a closed bound window fails with window_gone instead of drifting to another window", async () => {
+  const chrome = fakeChrome(1);
+  const ops = root.createTabOps(chrome);
+  await assert.rejects(
+    ops.create("https://example.com", false, { windowId: 9 }),
+    (error) => error.code === "window_gone" && /window_gone/.test(error.message) && error.retryable === false
+  );
+  assert.deepEqual(chrome.calls.windowsCreate, []);
+  assert.equal(chrome.calls.tabsCreate.length, 1);
+  assert.equal(chrome.calls.tabsCreate[0].windowId, 9);
+});
+
+test("a bound windowId wins over newWindow", async () => {
+  const chrome = fakeChrome(1);
+  const ops = root.createTabOps(chrome);
+  const tab = await ops.create("https://example.com", false, { windowId: 1, newWindow: true });
+  assert.deepEqual(chrome.calls.windowsCreate, []);
+  assert.equal(tab.windowId, 1);
+});
+
+test("window errors are recognized only for missing windows", () => {
+  assert.equal(root.isWindowGoneError(new Error("No window with id: 4.")), true);
+  assert.equal(root.isWindowGoneError(new Error("No current window")), false);
 });

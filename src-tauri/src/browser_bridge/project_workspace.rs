@@ -462,7 +462,7 @@ pub(super) mod tests {
             .insert("pending".into(), pending_tx);
         for identity in [&a, &b] {
             bridge.record_opened_tab(&identity.project_id, &identity.project_id, &identity.lane,
-                &json!({ "id": 7, "url": "https://example.org", "title": "tab", "active": true })).await;
+                &json!({ "id": 7, "url": "https://example.org", "title": "tab", "active": true }), None).await;
             bridge.needs_human.lock().await.insert(
                 (identity.lane.clone(), 7),
                 BrowserNeedsHumanTab {

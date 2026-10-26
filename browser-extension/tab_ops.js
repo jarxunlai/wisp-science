@@ -12,6 +12,20 @@ function isNoWindowError(error) {
   return /No current window/i.test(message);
 }
 
+// A project's bound window was closed (or belongs to a browser run that
+// ended). Wisp recognizes the window_gone code and binds a fresh window.
+function isWindowGoneError(error) {
+  var message = (error && error.message) || String(error || "");
+  return /No window with id/i.test(message);
+}
+
+function windowGoneError(windowId, error) {
+  var gone = new Error("window_gone: bound window " + windowId + " is no longer open (" + ((error && error.message) || String(error || "")) + ")");
+  gone.code = "window_gone";
+  gone.retryable = false;
+  return gone;
+}
+
 async function withTabRetry(operation, attempts) {
   var max = attempts || 4;
   var lastError = null;
@@ -39,7 +53,8 @@ function createTabOps(chromeLike, managedIds) {
   var pendingWindow = null;
 
   // Parallel opens that all find no window share the first new window
-  // instead of each opening their own.
+  // instead of each opening their own. Wisp serializes opens that bind a new
+  // project window, so a dedicated window is never shared across projects.
   var openInNewWindow = async function (url, active) {
     if (pendingWindow) {
       var shared = await pendingWindow;
@@ -84,15 +99,33 @@ function createTabOps(chromeLike, managedIds) {
       managed.clear();
       return true;
     },
-    create: async function (url, active) {
+    // placement.windowId opens in a project's bound window; placement.newWindow
+    // opens a dedicated window (unfocused unless active) for Wisp to bind.
+    // Without placement the tab goes to the current window, as before.
+    create: async function (url, active, placement) {
+      var windowId = placement && Number.isInteger(placement.windowId) ? placement.windowId : null;
+      var newWindow = !!(placement && placement.newWindow) && windowId === null;
       var tab;
-      try {
-        tab = await withTabRetry(function () {
-          return chromeLike.tabs.create({ url: url, active: active ?? false });
-        });
-      } catch (error) {
-        if (!isNoWindowError(error)) throw error;
+      if (windowId !== null) {
+        try {
+          tab = await withTabRetry(function () {
+            return chromeLike.tabs.create({ windowId: windowId, url: url, active: active ?? false });
+          });
+        } catch (error) {
+          if (isWindowGoneError(error)) throw windowGoneError(windowId, error);
+          throw error;
+        }
+      } else if (newWindow) {
         tab = await openInNewWindow(url, active);
+      } else {
+        try {
+          tab = await withTabRetry(function () {
+            return chromeLike.tabs.create({ url: url, active: active ?? false });
+          });
+        } catch (error) {
+          if (!isNoWindowError(error)) throw error;
+          tab = await openInNewWindow(url, active);
+        }
       }
       managed.add(tab.id);
       return publicTab(tab);
@@ -133,5 +166,6 @@ if (typeof self !== "undefined") {
   self.createTabOps = createTabOps;
   self.isTransientTabError = isTransientTabError;
   self.isNoWindowError = isNoWindowError;
+  self.isWindowGoneError = isWindowGoneError;
   self.withTabRetry = withTabRetry;
 }
