@@ -2964,6 +2964,64 @@ fn window_focus_tracking_survives_unordered_focus_handoff() {
     assert_reset();
 }
 
+// #1619: only the foreground window showing this exact session suppresses
+// its reminder; using another project or conversation does not.
+#[test]
+fn session_reminder_is_suppressed_only_while_its_session_is_in_front() {
+    let active_frames = HashMap::from([
+        ("main".to_string(), "session-a1".to_string()),
+        ("proj-b".to_string(), "session-b".to_string()),
+        ("proj-a2".to_string(), "session-a2".to_string()),
+    ]);
+    // Project A in front, project B's conversation finished in the background.
+    assert!(!super::session_in_foreground(
+        Some("main"),
+        &active_frames,
+        "session-b"
+    ));
+    // The user is looking at the finished conversation itself.
+    assert!(super::session_in_foreground(
+        Some("proj-b"),
+        &active_frames,
+        "session-b"
+    ));
+    // Same project, different conversation in front.
+    assert!(!super::session_in_foreground(
+        Some("proj-a2"),
+        &active_frames,
+        "session-a1"
+    ));
+    // Every window in the background, or a window with no conversation.
+    assert!(!super::session_in_foreground(
+        None,
+        &active_frames,
+        "session-b"
+    ));
+    assert!(!super::session_in_foreground(
+        Some("home-1"),
+        &active_frames,
+        "session-b"
+    ));
+}
+
+#[test]
+fn session_notice_reaches_only_windows_of_other_projects() {
+    let active_projects = HashMap::from([
+        ("main".to_string(), "project-a".to_string()),
+        ("proj-b".to_string(), "project-b".to_string()),
+        ("proj-b2".to_string(), "project-b".to_string()),
+        ("proj-c".to_string(), "project-c".to_string()),
+        ("pet".to_string(), "project-a".to_string()),
+    ]);
+    assert_eq!(
+        super::foreign_notice_labels("project-b", &active_projects),
+        vec!["main".to_string(), "proj-c".to_string()],
+    );
+    // Only the owning project is open: nobody needs a cross-project notice.
+    let only_b = HashMap::from([("proj-b".to_string(), "project-b".to_string())]);
+    assert!(super::foreign_notice_labels("project-b", &only_b).is_empty());
+}
+
 // Click-to-open (#434, #499): a notification arms one navigation for its
 // window, and native activation/focus consumes the exact payload only once.
 #[test]

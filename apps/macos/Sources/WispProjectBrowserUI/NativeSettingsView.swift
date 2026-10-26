@@ -174,7 +174,7 @@ struct NativeSettingsView: View {
                 fields("get_appearance_prefs", [.init(key: "selection_popup_enabled", label: "选中文本快捷菜单", kind: .toggle)])
                 Divider().padding(.vertical, 8)
                 Text(localized("通知与更新")).font(WispDesign.font(size: 15, weight: .semibold))
-                fields("get_settings", [.init(key: "notifications_enabled", label: "桌面通知", kind: .toggle, hint: "窗口不在前台时，任务完成、失败或等待确认会发送系统通知。")])
+                fields("get_settings", [.init(key: "notifications_enabled", label: "桌面通知", kind: .toggle, hint: "任务完成、失败或等待确认时发送系统通知；只有前台窗口正在显示该会话时才不提醒，在其他项目或其他会话中工作仍会提醒。对应会话只会在启动任务的窗口打开。")])
                 HStack {
                     Spacer()
                     Button(localized("取消")) { state.discardDrafts() }

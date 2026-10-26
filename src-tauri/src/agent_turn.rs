@@ -671,7 +671,7 @@ async fn send_message_inner_with_continuation(
                     channels::publish_turn_answer(&frame_id, &messages);
                 }
                 state.running_turns.lock().await.remove(&frame_id);
-                mark_seen_if_viewed(state, &frame_id).await;
+                mark_seen_if_viewed(state, &app, &frame_id).await;
                 persist_and_emit_terminal_event(
                     state,
                     &app,
@@ -688,7 +688,7 @@ async fn send_message_inner_with_continuation(
             }
             Err(error) => {
                 state.running_turns.lock().await.remove(&frame_id);
-                mark_seen_if_viewed(state, &frame_id).await;
+                mark_seen_if_viewed(state, &app, &frame_id).await;
                 persist_and_emit_terminal_event(
                     state,
                     &app,
@@ -1958,7 +1958,7 @@ async fn send_message_inner_with_continuation(
     }
     drop(guard);
     // After the persist flush so the seen snapshot covers the final messages.
-    mark_seen_if_viewed(state, &frame_id).await;
+    mark_seen_if_viewed(state, &app, &frame_id).await;
 
     match result {
         Ok(outcome) => {

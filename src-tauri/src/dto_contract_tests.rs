@@ -639,6 +639,27 @@ fn trajectory_snapshot_contract() {
 }
 
 #[test]
+fn session_notice_contract() {
+    let notice = wisp_dto::SessionNotice {
+        project_id: "proj-b".into(),
+        project_name: "Project B".into(),
+        session_id: "s-b".into(),
+        session_title: "Long fit".into(),
+        kind: "done".into(),
+    };
+    let dto: wisp_dto::SessionNotice = roundtrip(&notice);
+    assert_eq!(dto, notice);
+    let sparse: wisp_dto::SessionNotice = serde_json::from_value(serde_json::json!({
+        "project_id": "proj-b",
+        "session_id": "s-b",
+        "kind": "error",
+    }))
+    .unwrap();
+    assert_eq!(sparse.project_name, "");
+    assert_eq!(sparse.session_title, "");
+}
+
+#[test]
 fn browser_tab_cleanup_prompt_contract() {
     let prompt = wisp_dto::BrowserTabCleanupPrompt {
         turn_id: "turn-1".into(),

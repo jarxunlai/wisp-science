@@ -1646,6 +1646,21 @@ pub struct SessionSearchInfo {
     pub shelved: bool,
 }
 
+/// A conversation in another project finished (#1619). Emitted as
+/// `session-notice` only to windows bound to a different project: the owning
+/// project's windows already receive the live `agent` stream.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct SessionNotice {
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub session_title: String,
+    /// `done` or `error`, matching the `notify.*` title keys.
+    pub kind: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComposerReferenceArg {

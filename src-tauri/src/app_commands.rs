@@ -95,11 +95,13 @@ fn show_clickable_notification(
         .map_err(|error| error.to_string())
 }
 
-/// Desktop notification for task status (#327). No-op while any app window is
-/// focused (the in-app UI already shows the state). The banner and the sound
-/// cue (#1595) are switched separately in settings; this is a no-op only when
-/// both are off. Clicking the notification navigates to the session it was
-/// about (#434) — native callbacks also restore a hidden/minimized window (#499).
+/// Desktop notification for task status (#327). No-op only while the
+/// foreground window is showing this very session (#1619): using another
+/// project, or another conversation, must not swallow the reminder. The banner
+/// and the sound cue (#1595) are switched separately in settings; this is a
+/// no-op when both are off. Clicking the notification navigates to the session
+/// it was about (#434) — native callbacks also restore a hidden/minimized
+/// window (#499).
 #[tauri::command]
 pub(super) async fn notify_user(
     window: tauri::Window,
@@ -108,7 +110,12 @@ pub(super) async fn notify_user(
     body: String,
     session_id: String,
 ) -> Result<(), String> {
-    if app_is_foreground(window.app_handle()) {
+    let watching = {
+        let foreground = foreground_window_label(window.app_handle());
+        let active_frames = state.active_frame.read().unwrap();
+        session_in_foreground(foreground.as_deref(), &active_frames, &session_id)
+    };
+    if watching {
         return Ok(());
     }
     let Some(announcement) = crate::notification_sound::Announcement::new(
@@ -117,10 +124,11 @@ pub(super) async fn notify_user(
     ) else {
         return Ok(());
     };
-    // The done/attention agent events are broadcast to every window, so every
-    // window calls this command for every session. Select one exact owner,
-    // rather than only checking the project: two windows may legitimately show
-    // different conversations from the same project.
+    // Every window of the session's project gets the live agent event, and
+    // windows of other projects get `session-notice`, so several windows call
+    // this command for one event. Select one exact owner, rather than only
+    // checking the project: two windows may legitimately show different
+    // conversations from the same project.
     let project_id = state
         .store
         .frame_project_id(&session_id)

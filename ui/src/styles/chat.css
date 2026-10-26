@@ -562,6 +562,10 @@
   background: var(--info); color: #fff; font-size: calc(10px * var(--ui-font-scale, 1)); font-weight: 600;
   line-height: 14px; text-align: center; pointer-events: none;
 }
+.inbox-other-dot {
+  position: absolute; top: 2px; right: 2px; width: 7px; height: 7px;
+  border-radius: 999px; background: var(--text-faint); pointer-events: none;
+}
 .inbox-drop {
   position: absolute; top: calc(100% + 6px); right: 0; z-index: 91;
   width: 300px; max-height: 380px; overflow-y: auto;
@@ -2181,6 +2185,37 @@ button.stop:disabled { opacity: .45; cursor: default; }
 .stopping-text span { font-size: calc(12px * var(--ui-font-scale, 1)); color: var(--text-muted); line-height: 1.4; }
 .copy-toast { position: fixed; z-index: 200; left: 50%; bottom: 28px; transform: translateX(-50%); width: max-content; max-width: min(560px, calc(100vw - 32px)); padding: 8px 14px; border-radius: 999px; background: var(--text); color: var(--bg-elev); box-shadow: var(--shadow); font-size: calc(12.5px * var(--ui-font-scale, 1)); font-weight: 600; line-height: 1.35; text-align: center; pointer-events: none; }
 .copy-toast-warning { background: color-mix(in srgb, var(--warn) 88%, black 12%); color: white; }
+/* Cross-project completion cards (#1619): above pages, below dialogs. */
+.session-notice-stack {
+  position: fixed; z-index: 95; right: 16px; bottom: 16px;
+  display: flex; flex-direction: column; gap: 8px;
+  width: min(340px, calc(100vw - 32px));
+}
+.session-notice {
+  display: flex; align-items: center; gap: 10px; padding: 10px 10px 10px 12px;
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 28px rgba(0,0,0,.14);
+  animation: motion-surface-in-soft var(--motion-duration-fast) var(--motion-ease-decelerate) both;
+}
+.session-notice-icon { flex: 0 0 auto; display: inline-flex; color: var(--ok); }
+.session-notice-error .session-notice-icon { color: var(--err); }
+.session-notice-icon svg { width: 18px; height: 18px; }
+.session-notice-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.session-notice-project { font-size: calc(11px * var(--ui-font-scale, 1)); font-weight: 600; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-notice-title { font-size: calc(13px * var(--ui-font-scale, 1)); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-notice-status { font-size: calc(11.5px * var(--ui-font-scale, 1)); color: var(--text-muted); }
+.session-notice-open {
+  flex: 0 0 auto; padding: 4px 10px; border-radius: var(--radius-xs);
+  border: 1px solid var(--border-strong); background: transparent; color: var(--text);
+  font-size: calc(12px * var(--ui-font-scale, 1)); cursor: pointer;
+}
+.session-notice-open:hover, .session-notice-dismiss:hover { background: var(--surface-hover); }
+.session-notice-dismiss {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0; border: 0; border-radius: var(--radius-xs);
+  background: transparent; color: var(--text-muted); cursor: pointer;
+}
+.session-notice-dismiss svg { width: 14px; height: 14px; }
 .stopping-spinner { flex: 0 0 auto; width: 16px; height: 16px; border-radius: 50%;
   border: 2px solid hsl(0 70% 50% / 0.25); border-top-color: var(--err);
   animation: stopping-spin var(--agent-spin-duration) linear infinite; }

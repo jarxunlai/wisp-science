@@ -1206,16 +1206,33 @@ fn last_role_needs_you(role: Option<&str>) -> bool {
 
 /// A finished turn counts as viewed when some window is showing the session,
 /// so live-watched replies don't flag "needs you" on other surfaces.
-async fn mark_seen_if_viewed(state: &AppState, frame_id: &str) {
-    let viewed = state
-        .active_frame
-        .read()
-        .unwrap()
-        .values()
-        .any(|f| f == frame_id);
+/// Mark a finished reply seen only when the user is looking at it (#1619). A
+/// background window that merely has the session open must leave it in the
+/// Needs-you inbox; that window marks it seen when it next gains focus.
+async fn mark_seen_if_viewed(state: &AppState, app: &AppHandle, frame_id: &str) {
+    let viewed = {
+        let foreground = foreground_window_label(app);
+        let active_frames = state.active_frame.read().unwrap();
+        session_in_foreground(foreground.as_deref(), &active_frames, frame_id)
+    };
     if viewed {
         let _ = state.store.mark_frame_seen(frame_id).await;
     }
+}
+
+/// A window that gains focus while showing a conversation has now shown its
+/// latest reply to the user.
+fn mark_focused_session_seen(window: &tauri::Window) {
+    let Some(state) = window.try_state::<AppState>() else {
+        return;
+    };
+    let Some(frame_id) = state.active_frame(window.label()) else {
+        return;
+    };
+    let store = state.store.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = store.mark_frame_seen(&frame_id).await;
+    });
 }
 
 /// A reloaded transcript row for the UI to render (role in
@@ -2115,6 +2132,7 @@ async fn persist_and_emit_terminal_event(
         Err(error) => tracing::warn!("load terminal UI event sequence failed: {error}"),
     }
     let project_id = state.store.frame_project_id(frame_id).await.ok().flatten();
+    emit_session_notice(state, app, project_id.as_deref(), &event).await;
     emit_agent_event_in(app, event, project_id.as_deref());
 }
 
@@ -5232,32 +5250,119 @@ fn app_has_focus() -> bool {
     !focused_windows().lock().unwrap().is_empty()
 }
 
-/// Whether the user is looking at one of this app's windows.
+/// The app window the user is looking at, if any.
 ///
 /// On Windows the WebView2 child HWND owns keyboard focus, so the top-level
 /// window reports `Focused(false)` right after every `Focused(true)` and the
 /// recorded set is empty while the user is actively using the app. The
 /// foreground window is the reliable signal there: it names exactly one
 /// top-level window no matter which child holds focus.
-fn app_is_foreground(app: &AppHandle) -> bool {
-    if app_has_focus() {
-        return true;
+fn foreground_window_label(app: &AppHandle) -> Option<String> {
+    if let Some(label) = focused_windows().lock().unwrap().iter().min().cloned() {
+        return Some(label);
     }
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
         let foreground = unsafe { GetForegroundWindow() }.0 as usize;
         if foreground != 0 {
-            return app.workspace_surfaces().values().any(|window| {
-                window
-                    .hwnd()
-                    .is_ok_and(|hwnd| hwnd.0 as usize == foreground)
-            });
+            return app
+                .workspace_surfaces()
+                .into_iter()
+                .find(|(_, window)| {
+                    window
+                        .hwnd()
+                        .is_ok_and(|hwnd| hwnd.0 as usize == foreground)
+                })
+                .map(|(label, _)| label);
         }
     }
     #[cfg(not(target_os = "windows"))]
     let _ = app;
-    false
+    None
+}
+
+/// Whether the user is already looking at this conversation (#1619).
+///
+/// Only the foreground window counts, and only while it shows this exact
+/// session: a foreground window on another project, or on another conversation
+/// of the same project, must not swallow the reminder.
+fn session_in_foreground(
+    foreground: Option<&str>,
+    active_frames: &HashMap<String, String>,
+    frame_id: &str,
+) -> bool {
+    foreground
+        .and_then(|label| active_frames.get(label))
+        .is_some_and(|viewed| viewed == frame_id)
+}
+
+/// Windows bound to a project other than the session's (#1619). They never
+/// receive that project's live `agent` stream, so a cross-project completion
+/// reaches them only through `session-notice`.
+fn foreign_notice_labels(
+    project_id: &str,
+    active_projects: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut labels = active_projects
+        .iter()
+        .filter(|(label, active)| label.as_str() != "pet" && active.as_str() != project_id)
+        .map(|(label, _)| label.clone())
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels
+}
+
+/// Tell windows of other projects that a conversation finished (#1619), so
+/// they can show an in-app card and offer the desktop notification. Projects
+/// hidden by privacy mode and the research assistant's own project stay silent.
+async fn emit_session_notice(
+    state: &AppState,
+    app: &AppHandle,
+    project_id: Option<&str>,
+    event: &AgentEvent,
+) {
+    let kind = match event {
+        AgentEvent::Done { stop_reason, .. } if stop_reason.as_deref() != Some("compact") => "done",
+        AgentEvent::Error { .. } => "error",
+        _ => return,
+    };
+    let Some(project_id) = project_id.filter(|id| !wisp_store::is_assistant_project_id(id)) else {
+        return;
+    };
+    let labels = {
+        let active = state.active.read().unwrap();
+        let active_projects = active
+            .iter()
+            .map(|(label, project)| (label.clone(), project.id.clone()))
+            .collect::<HashMap<_, _>>();
+        foreign_notice_labels(project_id, &active_projects)
+    };
+    if labels.is_empty() {
+        return;
+    }
+    if crate::privacy_mode::load(&state.store)
+        .await
+        .is_ok_and(|privacy| {
+            privacy.active && privacy.project_ids.iter().any(|id| id == project_id)
+        })
+    {
+        return;
+    }
+    let frame_id = event.frame_id();
+    let Ok(Some(row)) = state.store.get_session_reference(frame_id).await else {
+        return;
+    };
+    let notice = wisp_dto::SessionNotice {
+        project_id: project_id.to_string(),
+        project_name: row.project_name,
+        session_id: frame_id.to_string(),
+        session_title: row.title,
+        kind: kind.into(),
+    };
+    for label in labels {
+        let _ = app.emit_to(&label, "session-notice", notice.clone());
+    }
 }
 
 /// The `open-session` payload a window's most recent desktop notification was
@@ -7289,6 +7394,7 @@ pub fn run() {
                 ui_health::note_focus(window.label(), *focused);
                 if *focused {
                     drain_pending_notify_target(window);
+                    mark_focused_session_seen(window);
                 }
             }
             tauri::WindowEvent::Destroyed => {
