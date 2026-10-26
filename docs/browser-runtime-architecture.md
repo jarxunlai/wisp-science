@@ -1,6 +1,6 @@
 # Browser Runtime architecture
 
-Wisp extension 0.4.2 treats the Chrome extension as a **controlled access adapter**.
+Wisp extension 0.4.3 treats the Chrome extension as a **controlled access adapter**.
 The desktop process owns sessions, waits, staging, and approval.
 
 ```
@@ -50,6 +50,74 @@ existing recovery behavior. Closing a Wisp window still leaves its running
 sessions alive; idle-window reclamation and a dedicated workspace status UI
 remain follow-up work.
 
+## Tab ownership and the project window
+
+A lane lease stops two projects from driving one browser at the same time,
+but it does not decide *which tabs* an agent may touch. Since extension
+0.4.3 the Runtime also scopes every browser tool to the calling
+conversation (#1617, phase 1):
+
+- **Scope.** Each tool call derives a `ToolScope` (resolved lane, project
+  id, conversation frame id) from the trusted ToolEnv only — never from tool
+  arguments. Browser tools exist only on the main agent, so the frame is the
+  agent's identity. Without a project and a frame (the CLI, older tests)
+  there is no scope and no enforcement, matching the lease skip rule.
+- **Ownership.** Each lane keeps a memory-only map from tab id to the
+  owning project and frame. A tab is owned when `web_open_tab` or a JSON
+  `tabs.create` opens it, when a tab the conversation operates opens it as a
+  popup (the extension's `newTabs` carry `openerTabId`; only tabs whose
+  opener is the operated tab are adopted), or when the user approves a grant.
+- **Enforcement.** One check (`authorize_tab` / `select_tab`) gates every
+  path: `web_scan` (including `tabs_only`), `web_execute_js`,
+  `web_screenshot`, `web_save_assets` and `web_agent_*`. Without
+  `switch_tab_id` a tool picks the conversation's last selected tab, else its
+  first owned tab — never the profile's active or first tab — and fails with
+  instructions when the conversation has none. Selection is remembered per
+  frame, not per lane. Tab lists returned by `{"cmd":"tabs"}` and a close
+  command's `remaining` are filtered to the scope.
+- **Embedded references.** `web_execute_js` parses JSON commands the way
+  the extension does: `tabs.close` `tabIds`/`tabId`, `tabs.switch` `tabId`
+  and `cdp` `tabId` must be owned (integral floats such as `42.0` count as
+  ids), and CDP `Target.*` and `Browser.*` methods are refused because they
+  reach other targets and windows. A script shaped like a JSON object that
+  serde cannot parse is refused rather than run as page JavaScript.
+- **Grants.** An explicit tab id (or `switch_tab_id: "active"`, the user's
+  focused tab outside Wisp's project windows) that exists but is not owned
+  triggers an approval prompt naming the tab's title and URL, and whether
+  another conversation or project controls it. Approving moves ownership to
+  the caller; refusing fails the call before anything reaches the extension.
+  An "auto-approve everything" approval scope auto-approves this prompt too.
+- **Fixed project window.** With the `window_binding` capability, a scoped
+  `tabs.create` carries the project's bound `windowId`; the first one sends
+  `newWindow: true` and the returned window id is bound to the project on
+  that lane. Opens that bind a window are serialized. If the bound window
+  was closed, the extension returns `window_gone`; the Runtime clears the
+  binding, opens a new window for the same project, rebinds it, and says so
+  in the tool result (`window_note`). It never falls back to the focused
+  window. An extension without `window_binding` keeps opening tabs in the
+  current window and the result says the fixed window is unavailable;
+  ownership is still enforced bridge-side.
+- **Lifetime.** Ownership and window bindings are memory only. The
+  extension reports a per-browser-run id (`browser_instance`, kept in
+  `chrome.storage.session`); on a connection's first handshake the lane's
+  owners and bindings are cleared unless the run id matches, because a
+  restarted Chrome reuses tab and window ids. A service-worker restart keeps
+  them. An app restart, an extension without a run id, or stopping a project
+  workspace drops them, so ownership only ever shrinks. Closing tabs through
+  Wisp removes their owners.
+- **Needs-human commands.** Confirming or focusing a verification tab from
+  the app acts only on tabs whose recorded frame belongs to the window's
+  project; the frame id the UI sends back is not trusted.
+
+**This is tab isolation, not account isolation.** Every tab in the shared
+profile shares its cookies, sign-ins and site storage. Use a project
+workspace when logins must be separated.
+
+Turn-end cleanup still uses the per-turn ledger of tabs Wisp created; the
+shared-lane lease and project workspaces are unchanged. Native tab groups,
+an in-app ownership display, grant management, persistence across restarts
+and download attribution are phase 2 follow-ups.
+
 ### Workspace mode needs a build that still loads unpacked extensions
 
 The workspace window is launched with `--load-extension` pointed at a copy
@@ -98,7 +166,9 @@ read *Connected to Wisp* while Wisp reports `connected=false`.
 
 ## What the extension does
 
-- Handshake: `extension_version`, `protocol_version=2`, `capabilities[]`
+- Handshake: `extension_version`, `protocol_version=2`, `capabilities[]`, `browser_instance`
+- Tab creation in a bound project window, or a new dedicated window (`window_binding`); `window_gone` when the bound window is closed
+- `newTabs` in each result with `openerTabId`, so popups can be attributed
 - Controlled service-worker reload (`runtime_reload`) after the managed package is verified
 - Conditional wait (URL / selector / text / settle)
 - Article scan (`images[]`, `figures[]`, `code_blocks[]`)
@@ -119,6 +189,7 @@ The extension never writes project directories and never returns large base64 fi
   `workspace` routing
 - Copies staged files into the project and hashes SHA-256
 - Starts/stops the workspace browser window and verifies it connected
+- Per-conversation tab ownership, grant prompts, and one bound browser window per project (see above)
 - Per-turn ledger of tabs Wisp created (`web_open_tab` / tab-create), closed at turn end or confirmed in the UI
 - Records the last refused connection so an unclaimed extension has a reason
 - Maintains and verifies the stable shared-extension directory and rechecks the

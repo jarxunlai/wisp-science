@@ -88,6 +88,36 @@ relay the install steps only if that call fails too.
    extension waits for complete before running the script, and again if
    the script navigates.
 
+## Tab isolation — you only see and drive your own tabs
+
+In the desktop app the runtime scopes every browser tool to **this
+conversation**. This is enforced by Wisp, not left to you:
+
+- **Your tabs** are the ones `web_open_tab` (or a `tabs.create` command)
+  opened for this conversation, popups those tabs opened, and tabs the user
+  shared with you. `web_scan tabs_only`, `{"cmd":"tabs"}` and a close
+  command's `remaining` list only those.
+- **Without `switch_tab_id`** tools use your last tab or your first one —
+  never the user's active tab or another conversation's tab. With no tab
+  yet, the call fails and tells you to open one.
+- **The user's own page** ("summarize the page I have open"): pass
+  `switch_tab_id: "active"` (or a known id). The user sees the tab's title
+  and URL and approves or refuses. A refusal is final for that tab — do not
+  retry; open your own tab with `web_open_tab` instead. Approving moves the
+  tab to this conversation, even from another conversation.
+- **Embedded ids** in `tabs.close`, `tabs.switch` and `cdp` `tabId` must be
+  your tabs; they are refused, not offered for approval. CDP `Target.*`
+  and `Browser.*` methods are always refused.
+- **Fixed window:** new tabs open in this project's own browser window, not
+  the window the user is working in. If the user closed it, Wisp opens a new
+  one and says so in `window_note`. An older extension without
+  `window_binding` opens tabs in the current window and says so; ownership
+  checks still apply — suggest `browser_setup {"action":"update_extension"}`.
+- **Not account isolation:** every tab in the shared profile shares its
+  cookies and sign-ins. Opening `chatgpt.com` in your own tab is signed in
+  just like the user's. For separate logins, use the project workspace
+  browser (`start_workspace`) only when the user asks for isolation.
+
 ## Recipes (`web_execute_js` `script`)
 
 | Goal | script |
@@ -103,8 +133,8 @@ relay the install steps only if that call fails too.
 | Goal | JSON command |
 |---|---|
 | Switch to & focus a tab (so the user sees it) | `{"cmd":"tabs","method":"switch","tabId":<id>}` |
-| List tabs | `{"cmd":"tabs"}` (or just `web_scan tabs_only`) |
-| Close tabs you opened | `{"cmd":"tabs","method":"close","tabIds":[<id>,...]}` — returns `closed` + `remaining` |
+| List your tabs | `{"cmd":"tabs"}` (or just `web_scan tabs_only`) |
+| Close tabs you opened | `{"cmd":"tabs","method":"close","tabIds":[<id>,...]}` — returns `closed` + your `remaining` tabs |
 | Trusted click when `.click()` is ignored | `{"cmd":"cdp","method":"Input.dispatchMouseEvent","params":{"type":"mousePressed","x":<x>,"y":<y>,"button":"left","clickCount":1}}` then the same with `"type":"mouseReleased"` — use the element's `rect` centre from `web_scan` |
 
 Prefer plain JS. Reach for `cmd:cdp` only when a page blocks synthetic
@@ -113,7 +143,9 @@ events or you truly need trusted input.
 ## In-browser chat — `web_agent_send` / `web_agent_wait` / `web_agent_read`
 
 Use these on an **already signed-in** tab. They are not a new Wisp agent;
-they drive the chat composer in the user's Chrome.
+they drive the chat composer in the user's Chrome. Only your tabs count:
+open the chat site with `web_open_tab` (the shared profile keeps the
+sign-in), or ask for the user's chat tab with `switch_tab_id: "active"`.
 
 Supported tabs (HTTPS, exact host, no lookalikes):
 
@@ -158,7 +190,8 @@ already open.
   need it, or if the user explicitly asks now.
 
 Close **only ids you opened yourself**. Tabs the user had open, or ones
-they opened during the task, are theirs.
+they opened during the task, are theirs. The runtime now refuses a close
+command that names a tab outside this conversation.
 
 ## Stop conditions (do not automate through these)
 

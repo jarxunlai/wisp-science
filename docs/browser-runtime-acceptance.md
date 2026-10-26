@@ -1,6 +1,6 @@
 # Browser Runtime acceptance
 
-Use a Wisp build that bundles extension **0.4.2**. Load the unpacked extension from `browser_setup.extension_path` before testing.
+Use a Wisp build that bundles extension **0.4.3**. Load the unpacked extension from `browser_setup.extension_path` before testing.
 
 For #1107, test on Windows, macOS, and Linux with automatic launch enabled:
 close daily Chrome, call `browser_setup` with no action, and verify its normal
@@ -13,7 +13,7 @@ action must behave like an omitted action. Existing blank/new-tab pages are neve
 cleaned up by startup; ordinary per-turn cleanup still applies only to recorded
 tool-created tabs.
 
-1. Connect extension 0.2.1 and confirm the app shows current 0.2.1 / bundled 0.4.2, the verified managed path, and the update actions. **Update extension** must return the manual fallback, open the extension page, and clear only after Reload reconnects as 0.4.2. With an extension that advertises `runtime_reload`, the same action must reconnect automatically. `browser_setup` then shows `update_required=false`, `extension_version` 0.4.2, and `required_protocol` 2.
+1. Connect extension 0.2.1 and confirm the app shows current 0.2.1 / bundled 0.4.3, the verified managed path, and the update actions. **Update extension** must return the manual fallback, open the extension page, and clear only after Reload reconnects as 0.4.3. With an extension that advertises `runtime_reload`, the same action must reconnect automatically. `browser_setup` then shows `update_required=false`, `extension_version` 0.4.3, and `required_protocol` 2.
    With the extension connected, quit Wisp without closing Chrome, wait two
    minutes, and restart Wisp: the extension must reconnect on its own within
    about two minutes (keepalive staleness plus the one-minute alarm) without a
@@ -44,6 +44,48 @@ Popup **Pause control** must fail later automations with `USER_CONTROLLING`.
    answer without it. **Stop** cancels a running turn. The context menu and
    `Alt+Shift+W` open the same panel. Quit Wisp and ask: the panel reports that
    Wisp is not running.
+
+## Tab ownership and the project window (#1617)
+
+Use two conversations (A1, A2) in project A and one (B1) in project B, all on
+`shared`, with a few of your own tabs open in your usual window.
+
+1. A1 opens two pages with `web_open_tab`. A new browser window opens without
+   taking focus, and both tabs land there. Focus your own window and have A1
+   open a third page: it still opens in A's window.
+2. A1 `web_scan tabs_only` lists only its own tabs. A2 lists none; its
+   `web_scan` without a tab id fails and points to `web_open_tab`. Neither
+   ever reads your active tab by default.
+3. A2 calls `web_scan` with A1's tab id: the app asks whether A2 may control
+   that tab, naming its title and URL and that another conversation in the
+   project controls it. **Deny** fails the call and nothing in the browser
+   changes. A2 opening its own page uses A's window too.
+4. A1 asks for "the page I'm looking at" (`switch_tab_id: "active"`) while
+   your own tab is focused: the prompt names your tab. Approve, and A1 can read
+   it; later `tabs_only` includes it without asking again.
+5. A1 runs `web_execute_js` with `{"cmd":"tabs","method":"close","tabIds":[<your tab>]}`
+   for a tab you did not share, `{"cmd":"tabs","method":"switch","tabId":<id>}`,
+   a `cdp` command with a foreign `tabId`, and `Target.createTarget`: all are
+   refused without touching the browser.
+6. A1 clicks a link with `target=_blank` on its own page. The result lists the
+   popup in `new_tabs`, and A1 can scan it. A tab you open by hand meanwhile
+   stays out of A1's list.
+7. Close A's window, then have A1 open a page: a new window opens, the result's
+   `window_note` says the old one was closed, and further opens use the new
+   window.
+8. After A's turns end, B1 opens a page: it gets its own window, and A's tabs
+   are neither listed nor usable by B1 without a prompt that names another
+   project.
+9. Restart Chrome (not Wisp): earlier tab ids no longer count as owned. Let the
+   extension service worker sleep and wake: ownership survives.
+10. With extension 0.4.2 connected, `web_open_tab` opens in the current window
+    and its result says the fixed window is unavailable and to update the
+    extension; ownership checks in steps 2–5 still hold.
+11. A verification prompt for one of B1's tabs cannot be confirmed or focused
+    from a window bound to project A.
+
+Window and tab ownership never separates cookies or accounts: every tab in the
+shared profile is signed in the same way. Use a project workspace for that.
 
 ## Project workspace isolation (#1325)
 

@@ -75,6 +75,36 @@ and verification prompts are discarded to avoid acting on reused tab ids.
 Closing a Wisp window continues to allow its active sessions to finish; use
 `stop_workspace` to explicitly release the browser resource.
 
+### Each conversation drives only its own tabs
+
+In the desktop app, browser tools work only on the calling conversation's
+tabs: the ones it opened, popups those tabs opened, and tabs you shared with
+it. Wisp enforces this; it does not rely on the model remembering tab ids.
+
+- The agent cannot list or use your tabs, or another conversation's tabs, by
+  default. Without a tab id it uses its own last tab, never your active tab.
+- When an agent asks for one of your tabs (for example "the page I have
+  open"), Wisp asks you first and names the tab's title and URL, and whether
+  another conversation or project is using it. **Allow** gives that
+  conversation control of the tab; **Deny** stops the request before anything
+  reaches the browser. An **auto-approve everything** permission scope
+  approves this prompt too.
+- Tab commands inside `web_execute_js` (closing, switching, a CDP `tabId`)
+  follow the same rule, and CDP `Target.*` / `Browser.*` methods are refused.
+- New tabs open in one browser window per project, created without taking
+  focus, so switching to another window does not pull Wisp's tabs into it.
+  If you close that window, the next new tab opens a fresh window for the
+  project and the agent is told. Extension versions before 0.4.3 open tabs in
+  the current window and the tool result says so; update the extension to get
+  the project window.
+- Ownership lives in memory: restarting Wisp or the browser forgets it, so
+  the agent must open new tabs or ask again. It never carries over to tab ids
+  a restarted browser reuses.
+
+This separates tabs and windows, **not cookies or accounts**: every tab in the
+shared profile is signed in to the same sites. Use a project workspace when
+logins must be kept apart.
+
 The banner describes the answer on screen, not the session. It is derived from
 the browser tool results of the latest turn only, and a single successful
 `web_scan`, `web_open_tab`, `web_execute_js`, or `web_screenshot` clears it: the
@@ -212,9 +242,10 @@ These settings must be changed manually because internal settings pages such as
   the script navigates or the tab returns to `loading`.
 - `web_open_tab`: open an HTTP(S) tab. The call waits until that tab's document
   is `complete` (or times out) and returns `ready` plus the real URL/title.
-  If the browser is still running with no window open, for example after
-  turn-end cleanup closed the last one, the tab opens in a new window; that
-  window takes focus only when `active` is true.
+  In the desktop app the tab opens in the project's own window (a new window
+  the first time); that window takes focus only when `active` is true. Without
+  a project, or with an extension older than 0.4.3, it opens in the current
+  window, or in a new window if the browser is running with none open.
   Blocked hosts from **Settings → Browser** are refused before the tab opens.
   When a prefer list is set, a successful result includes `preferred` so
   literature tasks can stay on those sites.
@@ -234,7 +265,8 @@ Both tools normally require at least one Wisp approval. The approval can be
 granted once, for the session, for the project, or globally through the existing
 approval card. A conversation with **Full Permission** enabled auto-approves the
 same request. Treat broad grants carefully: the extension has access to every
-HTTP(S) tab in that Chrome profile.
+HTTP(S) tab in that Chrome profile, and tab isolation is enforced by Wisp,
+not by Chrome.
 
 ## Security and limits
 
