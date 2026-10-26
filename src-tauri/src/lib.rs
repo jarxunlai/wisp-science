@@ -5250,6 +5250,7 @@ fn record_window_focus(label: &str, focused: bool) {
     }
 }
 
+#[cfg(test)]
 fn app_has_focus() -> bool {
     !focused_windows().lock().unwrap().is_empty()
 }
