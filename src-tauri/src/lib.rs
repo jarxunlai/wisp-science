@@ -715,6 +715,7 @@ struct SkillInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     managed_by: Option<String>,
     dir: String,
+    copies: Vec<wisp_dto::SkillCopy>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1208,18 +1209,15 @@ fn last_role_needs_you(role: Option<&str>) -> bool {
     matches!(role, Some("assistant" | "internal"))
 }
 
-/// A finished turn counts as viewed when some window is showing the session,
-/// so live-watched replies don't flag "needs you" on other surfaces.
 /// Mark a finished reply seen only when the user is looking at it (#1619). A
 /// background window that merely has the session open must leave it in the
 /// Needs-you inbox; that window marks it seen when it next gains focus.
 async fn mark_seen_if_viewed(state: &AppState, app: &AppHandle, frame_id: &str) {
-    let viewed = {
-        let foreground = foreground_window_label(app);
-        let active_frames = state.active_frame.read().unwrap();
-        session_in_foreground(foreground.as_deref(), &active_frames, frame_id)
-    };
-    if viewed {
+    if session_in_foreground(
+        &foreground_window_labels(app),
+        frame_id,
+        &state.viewed_frames(),
+    ) {
         let _ = state.store.mark_frame_seen(frame_id).await;
     }
 }
@@ -4729,6 +4727,7 @@ fn skill_infos(
                 managed: false,
                 managed_by: None,
                 dir: s.dir.to_string_lossy().to_string(),
+                copies: skill_commands::skill_copies(skills.catalog_records(), &s.name),
             }
         })
         .collect()
@@ -5250,56 +5249,58 @@ fn record_window_focus(label: &str, focused: bool) {
     }
 }
 
-#[cfg(test)]
-fn app_has_focus() -> bool {
-    !focused_windows().lock().unwrap().is_empty()
+fn focused_window_labels() -> HashSet<String> {
+    focused_windows().lock().unwrap().clone()
 }
 
-/// The app window the user is looking at, if any.
+/// Labels of this app's windows the user is looking at right now.
 ///
 /// On Windows the WebView2 child HWND owns keyboard focus, so the top-level
 /// window reports `Focused(false)` right after every `Focused(true)` and the
 /// recorded set is empty while the user is actively using the app. The
 /// foreground window is the reliable signal there: it names exactly one
 /// top-level window no matter which child holds focus.
-fn foreground_window_label(app: &AppHandle) -> Option<String> {
-    if let Some(label) = focused_windows().lock().unwrap().iter().min().cloned() {
-        return Some(label);
-    }
+fn foreground_window_labels(app: &AppHandle) -> HashSet<String> {
+    let mut labels = focused_window_labels();
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
         let foreground = unsafe { GetForegroundWindow() }.0 as usize;
         if foreground != 0 {
-            return app
-                .workspace_surfaces()
-                .into_iter()
-                .find(|(_, window)| {
-                    window
-                        .hwnd()
-                        .is_ok_and(|hwnd| hwnd.0 as usize == foreground)
-                })
-                .map(|(label, _)| label);
+            labels.extend(
+                app.workspace_surfaces()
+                    .into_iter()
+                    .filter(|(_, window)| {
+                        window
+                            .hwnd()
+                            .is_ok_and(|hwnd| hwnd.0 as usize == foreground)
+                    })
+                    .map(|(label, _)| label),
+            );
         }
     }
     #[cfg(not(target_os = "windows"))]
     let _ = app;
-    None
+    labels
 }
 
-/// Whether the user is already looking at this conversation (#1619).
+/// Whether the user is looking at this conversation: one of the foreground
+/// windows is currently viewing it (#1619).
 ///
-/// Only the foreground window counts, and only while it shows this exact
-/// session: a foreground window on another project, or on another conversation
-/// of the same project, must not swallow the reminder.
+/// Desktop notifications are suppressed on this, not on "any app window is in
+/// front". A conversation finishing in a background window, or behind another
+/// conversation of the same project, is not being watched, so it still gets its
+/// banner and sound cue; only the exact session on screen is silent.
 fn session_in_foreground(
-    foreground: Option<&str>,
-    active_frames: &HashMap<String, String>,
+    foreground_labels: &HashSet<String>,
     frame_id: &str,
+    active_frames: &HashMap<String, String>,
 ) -> bool {
-    foreground
-        .and_then(|label| active_frames.get(label))
-        .is_some_and(|viewed| viewed == frame_id)
+    foreground_labels.iter().any(|label| {
+        active_frames
+            .get(label)
+            .is_some_and(|viewed| viewed == frame_id)
+    })
 }
 
 /// Windows bound to a project other than the session's (#1619). They never
@@ -5698,7 +5699,10 @@ fn skill_sources(root: &std::path::Path) -> Vec<(PathBuf, SkillSource)> {
     if let Some(b) = wisp_skills::bundled_dir() {
         paths.push((b, SkillSource::Bundled));
     }
-    paths.push((root.join(".wisp").join("skills"), SkillSource::Project));
+    paths.push((
+        skill_commands::project_skills_dir(root),
+        SkillSource::Project,
+    ));
     if let Some(home) = dirs::home_dir() {
         paths.push((home.join(".wisp").join("skills"), SkillSource::Global));
     }
@@ -7999,7 +8003,11 @@ pub fn run() {
             skill_commands::set_skills_enabled,
             skill_commands::set_skill_enabled,
             skill_commands::pick_skill_source,
+            skill_commands::skill_install_locations,
             skill_commands::install_skill,
+            skill_commands::promote_skill_to_global,
+            skill_commands::remove_project_skill_copy,
+            skill_commands::list_project_skill_packages,
             skill_commands::remove_skill,
             plugins::list_plugins,
             plugins::pick_plugin_source,

@@ -2819,6 +2819,7 @@ fn capability_skill_counts_use_enabled_bundled_vs_project_added_inventory() {
         managed: false,
         managed_by: None,
         dir: format!("/{scope}/{name}"),
+        copies: vec![],
     };
     let skills = vec![
         skill("bundled-on", "bundled", true),
@@ -2961,57 +2962,20 @@ fn app_activation_restores_workspaces_but_keeps_native_host_contexts_hidden() {
 
 #[test]
 fn window_focus_tracking_survives_unordered_focus_handoff() {
-    let assert_reset = || assert!(!super::app_has_focus());
+    let assert_reset = || assert!(super::focused_window_labels().is_empty());
     assert_reset();
     super::record_window_focus("main", true);
-    assert!(super::app_has_focus());
+    assert!(super::focused_window_labels().contains("main"));
     // Focus moves main → project window; gain may arrive before loss.
     super::record_window_focus("proj-a", true);
     super::record_window_focus("main", false);
-    assert!(super::app_has_focus());
+    assert_eq!(
+        super::focused_window_labels(),
+        HashSet::from(["proj-a".to_string()])
+    );
     // Destroyed window must not pin the app as focused forever.
     super::record_window_focus("proj-a", false);
     assert_reset();
-}
-
-// #1619: only the foreground window showing this exact session suppresses
-// its reminder; using another project or conversation does not.
-#[test]
-fn session_reminder_is_suppressed_only_while_its_session_is_in_front() {
-    let active_frames = HashMap::from([
-        ("main".to_string(), "session-a1".to_string()),
-        ("proj-b".to_string(), "session-b".to_string()),
-        ("proj-a2".to_string(), "session-a2".to_string()),
-    ]);
-    // Project A in front, project B's conversation finished in the background.
-    assert!(!super::session_in_foreground(
-        Some("main"),
-        &active_frames,
-        "session-b"
-    ));
-    // The user is looking at the finished conversation itself.
-    assert!(super::session_in_foreground(
-        Some("proj-b"),
-        &active_frames,
-        "session-b"
-    ));
-    // Same project, different conversation in front.
-    assert!(!super::session_in_foreground(
-        Some("proj-a2"),
-        &active_frames,
-        "session-a1"
-    ));
-    // Every window in the background, or a window with no conversation.
-    assert!(!super::session_in_foreground(
-        None,
-        &active_frames,
-        "session-b"
-    ));
-    assert!(!super::session_in_foreground(
-        Some("home-1"),
-        &active_frames,
-        "session-b"
-    ));
 }
 
 #[test]
@@ -3030,6 +2994,48 @@ fn session_notice_reaches_only_windows_of_other_projects() {
     // Only the owning project is open: nobody needs a cross-project notice.
     let only_b = HashMap::from([("proj-b".to_string(), "project-b".to_string())]);
     assert!(super::foreign_notice_labels("project-b", &only_b).is_empty());
+}
+
+// Foreground suppression is per session, not per app (#1619): the user working
+// in project A's window must still hear that project B's conversation ended.
+#[test]
+fn notification_is_silent_only_for_the_session_shown_in_a_foreground_window() {
+    let viewed = HashMap::from([
+        ("main".to_string(), "session-a".to_string()),
+        ("proj-b".to_string(), "session-b".to_string()),
+    ]);
+    let front = |labels: &[&str]| labels.iter().map(|l| l.to_string()).collect::<HashSet<_>>();
+
+    // Project A in front, project B's conversation ends in the background.
+    assert!(!super::session_in_foreground(
+        &front(&["main"]),
+        "session-b",
+        &viewed
+    ));
+    // The user is looking at the conversation that just ended.
+    assert!(super::session_in_foreground(
+        &front(&["proj-b"]),
+        "session-b",
+        &viewed
+    ));
+    // Same project window, but another conversation is on screen.
+    assert!(!super::session_in_foreground(
+        &front(&["main"]),
+        "session-a-sibling",
+        &viewed
+    ));
+    // Every window in the background keeps the existing behaviour.
+    assert!(!super::session_in_foreground(
+        &front(&[]),
+        "session-a",
+        &viewed
+    ));
+    // A focused window that views nothing (home / assistant) never silences.
+    assert!(!super::session_in_foreground(
+        &front(&["home-1"]),
+        "session-a",
+        &viewed
+    ));
 }
 
 // Click-to-open (#434, #499): a notification arms one navigation for its

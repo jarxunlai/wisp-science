@@ -3359,7 +3359,7 @@ fn App() -> impl IntoView {
     let trajectory_open_cb = trajectory_open;
     let fetch_trajectory_cb = fetch_trajectory.clone();
     // Desktop notification and sound cue for task status (#327, #1595). The
-    // backend drops them while the foreground window is showing that session
+    // backend drops them while a foreground window is showing that session
     // (#1619) or when both are disabled in settings, so callers just fire on
     // every done/error/approval event.
     let notify_desktop = move |frame_id: &str, kind: &str, detail: &str| {
@@ -6597,7 +6597,8 @@ fn App() -> impl IntoView {
 
     let reload_skills = Callback::new(move |_: ()| extensions.reload_skills());
 
-    let install_skill_from = move |path: String| extensions.install_skill_from(path);
+    let install_skill_from =
+        move |(path, scope): (String, String)| extensions.install_skill_from(path, scope);
 
     let refresh_plugins = move || extensions.refresh_plugins();
 
