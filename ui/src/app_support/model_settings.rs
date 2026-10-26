@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::bindings::invoke_timeout;
+use crate::network_settings::route_error;
 
 /// Wait this long for `save_model`. A reply lost on the way back from the
 /// backend (macOS 12 stall) must not leave the Models panel busy forever.
@@ -283,7 +284,12 @@ impl ModelSettingsState {
             (has_key && key.is_empty())
                 || matches!(provider_value(&form.provider), "openai_codex" | "xai_oauth"),
         );
-        if let Some(err_key) = settings_required_error_key(&cfg, &key) {
+        if let Some(err_key) = settings_required_error_key(&cfg, &key).or_else(|| {
+            route_error(
+                form.proxy_url.as_deref().unwrap_or_default(),
+                form.proxy_custom,
+            )
+        }) {
             let err = t(loc, err_key);
             let text = tf(loc, "status.save_failed", &[("msg", &err)]);
             model_form_msg.set(Some((false, text)));
@@ -314,7 +320,7 @@ impl ModelSettingsState {
         settings_busy.set(true);
         model_form_msg.set(Some((true, t(loc, "status.saving_settings").into())));
         let provider = provider_value(&form.provider);
-        let profile = serde_json::json!({
+        let mut profile = serde_json::json!({
             "id": form.id.clone().unwrap_or_default(),
             "label": form.label.trim(),
             "provider": provider,
@@ -342,6 +348,10 @@ impl ModelSettingsState {
             "video_aspect_ratio": form.video_aspect_ratio,
             "video_resolution": form.video_resolution,
         });
+        // Omitted keeps the endpoint's saved route.
+        if let Some(proxy_url) = form.proxy_url.as_deref() {
+            profile["proxy_url"] = proxy_url.trim().into();
+        }
         let key_arg = if key.is_empty() { None } else { Some(key) };
         spawn_local(async move {
             let arg = match json_args(&serde_json::json!({
@@ -444,6 +454,18 @@ impl ModelSettingsState {
             )));
             return;
         }
+        if let Some(err_key) = route_error(
+            form.proxy_url.as_deref().unwrap_or_default(),
+            form.proxy_custom,
+        ) {
+            let err = t(loc, err_key);
+            model_form_msg.set(Some((
+                false,
+                tf(loc, "status.save_failed", &[("msg", &err)]),
+            )));
+            return;
+        }
+        let proxy_url = form.proxy_url.as_deref().map(str::trim).map(str::to_string);
         // Image and video models first, then extra chat models, first chat
         // last so `save_model` leaves the cheaper/default chat profile active.
         let first_chat = entries.iter().position(|entry| {
@@ -487,7 +509,7 @@ impl ModelSettingsState {
                 let image = entry.is_image_model();
                 let video = entry.is_video_model();
                 let media = image || video;
-                let profile = serde_json::json!({
+                let mut profile = serde_json::json!({
                     "id": "",
                     "label": entry.label.trim(),
                     "provider": provider,
@@ -515,6 +537,9 @@ impl ModelSettingsState {
                     "video_aspect_ratio": Option::<String>::None,
                     "video_resolution": Option::<String>::None,
                 });
+                if let Some(proxy_url) = &proxy_url {
+                    profile["proxy_url"] = proxy_url.as_str().into();
+                }
                 let arg = match json_args(&serde_json::json!({
                     "profile": profile,
                     "key": key_arg,
@@ -618,7 +643,10 @@ impl ModelSettingsState {
             (form, has_key, profile_id)
         };
         let cfg = model_form_to_settings(&form, has_key);
-        if let Some(err_key) = settings_required_error_key(&cfg, &key) {
+        let proxy_url = model_form_proxy(&listed, &form);
+        if let Some(err_key) = settings_required_error_key(&cfg, &key)
+            .or_else(|| route_error(&proxy_url, form.proxy_custom))
+        {
             let err = t(loc, err_key);
             model_form_msg.set(Some((
                 false,
@@ -639,6 +667,7 @@ impl ModelSettingsState {
                 "key": key,
                 "profileId": profile_id,
                 "useForImageGeneration": image,
+                "proxyUrl": proxy_url.trim(),
             })) {
                 Ok(args) => args,
                 Err(err) => {
