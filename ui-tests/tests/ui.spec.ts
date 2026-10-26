@@ -3039,9 +3039,11 @@ test("the palette footer fade only paints while the list overflows", async ({ pa
 test("the needs-you inbox opens cross-project sessions in their own window", async ({ page }) => {
   await enterApp(page);
   const bell = page.locator(".inbox-wrap .icon-btn");
-  // Another project's session is listed but must not badge this window.
-  await expect(bell).toHaveAttribute("title", "0 need you");
+  // Another project's session is listed but must not badge this window; it
+  // only lights the separate other-projects dot (#1619).
+  await expect(bell).toHaveAttribute("title", "0 need you · 1 in other projects");
   await expect(bell.locator(".inbox-badge")).toHaveCount(0);
+  await expect(bell.getByTestId("inbox-other-dot")).toHaveCount(1);
   await bell.click();
   const item = page.locator(".inbox-item");
   await expect(page.locator(".inbox-drop .inbox-title").nth(1)).toHaveText("Other projects");
@@ -3060,6 +3062,93 @@ test("the needs-you inbox opens cross-project sessions in their own window", asy
     session: "s-other",
   });
   await expect(page.locator(".inbox-drop")).not.toBeVisible();
+});
+
+async function emitSessionNotice(page: Page, notice: Record<string, string>) {
+  await expect.poll(() => page.evaluate(() => Boolean((window as any).__tauriListenerReady?.("session-notice")))).toBe(true);
+  await page.evaluate((payload) => (window as any).__tauriEmit("session-notice", payload), notice);
+}
+
+const otherProjectNotice = {
+  project_id: "other",
+  project_name: "Other project",
+  session_id: "s-other",
+  session_title: "Cross-project counts",
+  kind: "done",
+};
+
+test("another project's finished conversation shows a card without taking focus (#1619)", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("draft stays put");
+  await emitSessionNotice(page, otherProjectNotice);
+  const card = page.getByTestId("session-notice");
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText("Other project");
+  await expect(card).toContainText("Cross-project counts");
+  await expect(card).toContainText("Task completed");
+  // The card never moves focus, switches project, or touches the draft.
+  await expect(composer(page)).toBeFocused();
+  await expect(composer(page)).toHaveValue("draft stays put");
+  await expect(newSessionButton(page)).toBeVisible();
+  expect(await invokeCount(page, "open_project_window")).toBe(0);
+  // One desktop reminder per notice, naming the project first; the backend
+  // picks the owning window and suppresses it if the session is in front.
+  await expect.poll(() => invokeArgsList(page, "notify_user")).toEqual([
+    { title: "Task completed", body: "Other project · Cross-project counts", sessionId: "s-other" },
+  ]);
+  // A second event for the same conversation replaces its card.
+  await emitSessionNotice(page, { ...otherProjectNotice, kind: "error" });
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText("Task failed");
+
+  await card.getByTestId("session-notice-open").click();
+  await expect.poll(() => lastInvokeArgs(page, "open_project_window")).toMatchObject({
+    id: "other",
+    session: "s-other",
+  });
+  await expect(card).toHaveCount(0);
+});
+
+test("session notices for this window's own project are ignored (#1619)", async ({ page }) => {
+  // enterApp opens the mock's "default" project in this window.
+  await enterApp(page);
+  await emitSessionNotice(page, { ...otherProjectNotice, project_id: "default", session_id: "s-here" });
+  await emitSessionNotice(page, { ...otherProjectNotice, session_id: "s-after" });
+  // The later foreign notice proves the first one was processed and dropped.
+  await expect(page.getByTestId("session-notice")).toHaveCount(1);
+  await expect(page.getByTestId("session-notice")).toHaveAttribute("data-session", "s-after");
+});
+
+test("Escape closes only the topmost session notice layer (#1619)", async ({ page }) => {
+  await enterApp(page);
+  await emitSessionNotice(page, { ...otherProjectNotice, session_id: "s-first", session_title: "First" });
+  await emitSessionNotice(page, { ...otherProjectNotice, session_id: "s-second", session_title: "Second" });
+  const cards = page.getByTestId("session-notice");
+  await expect(cards).toHaveCount(2);
+  // A menu above the cards takes the first Escape and leaves both cards.
+  await page.locator(".inbox-wrap .icon-btn").click();
+  await expect(page.locator(".inbox-drop")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".inbox-drop")).toHaveCount(0);
+  await expect(cards).toHaveCount(2);
+  // Then each press closes only the newest card.
+  await page.keyboard.press("Escape");
+  await expect(cards).toHaveCount(1);
+  await expect(cards).toHaveAttribute("data-session", "s-first");
+  await page.keyboard.press("Escape");
+  await expect(cards).toHaveCount(0);
+  await expect(newSessionButton(page)).toBeVisible();
+});
+
+test("dismissing a session notice keeps the others (#1619)", async ({ page }) => {
+  await enterApp(page);
+  await emitSessionNotice(page, { ...otherProjectNotice, session_id: "s-first", session_title: "First" });
+  await emitSessionNotice(page, { ...otherProjectNotice, session_id: "s-second", session_title: "Second" });
+  const cards = page.getByTestId("session-notice");
+  await cards.filter({ hasText: "First" }).getByTestId("session-notice-dismiss").click();
+  await expect(cards).toHaveCount(1);
+  await expect(cards).toHaveAttribute("data-session", "s-second");
+  expect(await invokeCount(page, "open_project_window")).toBe(0);
 });
 
 test("topbar groups chrome actions and hides an empty status hint", async ({ page }) => {
@@ -12348,7 +12437,8 @@ test("Escape closes plan feedback before rejecting the plan", async ({ page }) =
   await composer(page).fill("NEEDPLAN");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText("Review plan before starting?")).toBeVisible({ timeout: 10_000 });
-  await page.getByRole("button", { name: "Other" }).click();
+  // Exact: the Needs-you bell's name also mentions "other projects" (#1619).
+  await page.getByRole("button", { name: "Other", exact: true }).click();
   const feedback = page.getByPlaceholder("Tell wisp what to change in this plan.");
   await expect(feedback).toBeVisible();
 

@@ -1209,18 +1209,32 @@ fn last_role_needs_you(role: Option<&str>) -> bool {
     matches!(role, Some("assistant" | "internal"))
 }
 
-/// A finished turn counts as viewed when some window is showing the session,
-/// so live-watched replies don't flag "needs you" on other surfaces.
-async fn mark_seen_if_viewed(state: &AppState, frame_id: &str) {
-    let viewed = state
-        .active_frame
-        .read()
-        .unwrap()
-        .values()
-        .any(|f| f == frame_id);
-    if viewed {
+/// Mark a finished reply seen only when the user is looking at it (#1619). A
+/// background window that merely has the session open must leave it in the
+/// Needs-you inbox; that window marks it seen when it next gains focus.
+async fn mark_seen_if_viewed(state: &AppState, app: &AppHandle, frame_id: &str) {
+    if session_in_foreground(
+        &foreground_window_labels(app),
+        frame_id,
+        &state.viewed_frames(),
+    ) {
         let _ = state.store.mark_frame_seen(frame_id).await;
     }
+}
+
+/// A window that gains focus while showing a conversation has now shown its
+/// latest reply to the user.
+fn mark_focused_session_seen(window: &tauri::Window) {
+    let Some(state) = window.try_state::<AppState>() else {
+        return;
+    };
+    let Some(frame_id) = state.active_frame(window.label()) else {
+        return;
+    };
+    let store = state.store.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = store.mark_frame_seen(&frame_id).await;
+    });
 }
 
 /// A reloaded transcript row for the UI to render (role in
@@ -2120,6 +2134,7 @@ async fn persist_and_emit_terminal_event(
         Err(error) => tracing::warn!("load terminal UI event sequence failed: {error}"),
     }
     let project_id = state.store.frame_project_id(frame_id).await.ok().flatten();
+    emit_session_notice(state, app, project_id.as_deref(), &event).await;
     emit_agent_event_in(app, event, project_id.as_deref());
 }
 
@@ -5288,6 +5303,74 @@ fn session_in_foreground(
     })
 }
 
+/// Windows bound to a project other than the session's (#1619). They never
+/// receive that project's live `agent` stream, so a cross-project completion
+/// reaches them only through `session-notice`.
+fn foreign_notice_labels(
+    project_id: &str,
+    active_projects: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut labels = active_projects
+        .iter()
+        .filter(|(label, active)| label.as_str() != "pet" && active.as_str() != project_id)
+        .map(|(label, _)| label.clone())
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels
+}
+
+/// Tell windows of other projects that a conversation finished (#1619), so
+/// they can show an in-app card and offer the desktop notification. Projects
+/// hidden by privacy mode and the research assistant's own project stay silent.
+async fn emit_session_notice(
+    state: &AppState,
+    app: &AppHandle,
+    project_id: Option<&str>,
+    event: &AgentEvent,
+) {
+    let kind = match event {
+        AgentEvent::Done { stop_reason, .. } if stop_reason.as_deref() != Some("compact") => "done",
+        AgentEvent::Error { .. } => "error",
+        _ => return,
+    };
+    let Some(project_id) = project_id.filter(|id| !wisp_store::is_assistant_project_id(id)) else {
+        return;
+    };
+    let labels = {
+        let active = state.active.read().unwrap();
+        let active_projects = active
+            .iter()
+            .map(|(label, project)| (label.clone(), project.id.clone()))
+            .collect::<HashMap<_, _>>();
+        foreign_notice_labels(project_id, &active_projects)
+    };
+    if labels.is_empty() {
+        return;
+    }
+    if crate::privacy_mode::load(&state.store)
+        .await
+        .is_ok_and(|privacy| {
+            privacy.active && privacy.project_ids.iter().any(|id| id == project_id)
+        })
+    {
+        return;
+    }
+    let frame_id = event.frame_id();
+    let Ok(Some(row)) = state.store.get_session_reference(frame_id).await else {
+        return;
+    };
+    let notice = wisp_dto::SessionNotice {
+        project_id: project_id.to_string(),
+        project_name: row.project_name,
+        session_id: frame_id.to_string(),
+        session_title: row.title,
+        kind: kind.into(),
+    };
+    for label in labels {
+        let _ = app.emit_to(&label, "session-notice", notice.clone());
+    }
+}
+
 /// The `open-session` payload a window's most recent desktop notification was
 /// about, held until that window next gains focus. This lets a taskbar/Dock click
 /// navigate to the relevant session (#434). Native notification callbacks also
@@ -7317,6 +7400,7 @@ pub fn run() {
                 ui_health::note_focus(window.label(), *focused);
                 if *focused {
                     drain_pending_notify_target(window);
+                    mark_focused_session_seen(window);
                 }
             }
             tauri::WindowEvent::Destroyed => {

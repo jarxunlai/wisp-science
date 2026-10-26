@@ -124,10 +124,11 @@ pub(super) async fn notify_user(
     ) else {
         return Ok(());
     };
-    // The done/attention agent events are broadcast to every window, so every
-    // window calls this command for every session. Select one exact owner,
-    // rather than only checking the project: two windows may legitimately show
-    // different conversations from the same project.
+    // Every window of the session's project gets the live agent event, and
+    // windows of other projects get `session-notice`, so several windows call
+    // this command for one event. Select one exact owner, rather than only
+    // checking the project: two windows may legitimately show different
+    // conversations from the same project.
     let project_id = state
         .store
         .frame_project_id(&session_id)

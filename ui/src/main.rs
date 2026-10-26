@@ -9731,6 +9731,59 @@ fn App() -> impl IntoView {
     let inbox_here_count = create_memo(move |_| {
         inbox_sessions.with(|rows| rows.iter().filter(|s| inbox_in_this_project(s)).count())
     });
+    // Other projects get their own dot so the badge keeps meaning "this
+    // project" while finished work elsewhere is still visible (#1619).
+    let inbox_other_count = create_memo(move |_| {
+        inbox_sessions.with(|rows| rows.iter().filter(|s| !inbox_in_this_project(s)).count())
+    });
+    // Cross-project completion cards (#1619). The backend sends
+    // `session-notice` only to windows bound to another project.
+    let session_notices = create_rw_signal::<Vec<SessionNoticeCard>>(vec![]);
+    create_effect(move |_| {
+        inbox_sessions.with(|rows| {
+            let ids = rows.iter().map(|s| s.id.as_str()).collect::<HashSet<_>>();
+            let mut cards = session_notices.get_untracked();
+            if reconcile_session_notices(&mut cards, &ids) {
+                session_notices.set(cards);
+            }
+        });
+    });
+    let session_notice_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        let Ok(notice) = serde_wasm_bindgen::from_value::<SessionNotice>(payload) else {
+            return;
+        };
+        // This window's own project already gets the live agent stream.
+        if !show_projects.get_untracked()
+            && project_info
+                .get_untracked()
+                .is_some_and(|project| project.id == notice.project_id)
+        {
+            return;
+        }
+        // Every foreign window offers the desktop reminder; the backend picks
+        // one owner and skips it while that session is already in front.
+        let loc = locale.get_untracked();
+        let title = t(loc, &format!("notify.{}", notice.kind));
+        let body = session_notice_body(loc, &notice);
+        let session_id = notice.session_id.clone();
+        spawn_local(async move {
+            let arg = to_value(
+                &serde_json::json!({ "title": title, "body": body, "sessionId": session_id }),
+            )
+            .unwrap();
+            let _ = invoke("notify_user", arg).await;
+        });
+        session_notices.update(|cards| push_session_notice(cards, notice));
+        refresh_inbox();
+    }) as Box<dyn FnMut(JsValue)>);
+    let session_notice_js = session_notice_cb
+        .as_ref()
+        .unchecked_ref::<js_sys::Function>()
+        .clone();
+    session_notice_cb.forget();
+    spawn_local(async move {
+        let _ = listen_current_window("session-notice", &session_notice_js).await;
+    });
     // Close on any click that bubbles to the window; the bell and the dropdown
     // stop propagation (same pattern as the titlebar menus — a fixed backdrop
     // would be clipped to the topbar, whose backdrop-filter contains it).
@@ -10683,6 +10736,15 @@ fn App() -> impl IntoView {
                 ev.prevent_default();
                 return;
             }
+        }
+        // Cross-project completion cards float above pages but below dialogs
+        // and menus; one press closes only the newest card (#1619).
+        if session_notices.with(|cards| !cards.is_empty()) {
+            ev.prevent_default();
+            session_notices.update(|cards| {
+                cards.remove(0);
+            });
+            return;
         }
         if show_settings.get()
             && settings_section.get() == "workflows"
@@ -12458,6 +12520,7 @@ fn App() -> impl IntoView {
             on_export_directory=Callback::new(move |id| start_project_export.call((id, true)))
         />
         <ProjectTransferOverlay state=ProjectTransferOverlayState { locale, project_transfer } />
+        <SessionNoticeStack cards=session_notices locale=locale.read_only() on_open=palette_open_session />
         <ExternalLinkConfirm locale=locale pending=external_link_confirm />
         <BrowserTabCleanupOverlay
             state=BrowserTabCleanupOverlayState {
@@ -13042,7 +13105,14 @@ fn App() -> impl IntoView {
                         class:active=move || inbox_open.get()
                         title=move || {
                             let n = inbox_here_count.get().to_string();
-                            tf(locale.get(), "sess_status.needs_you_n", &[("n", &n)])
+                            match inbox_other_count.get() {
+                                0 => tf(locale.get(), "sess_status.needs_you_n", &[("n", &n)]),
+                                m => tf(
+                                    locale.get(),
+                                    "sess_status.needs_you_other_n",
+                                    &[("n", &n), ("m", &m.to_string())],
+                                ),
+                            }
                         }
                         on:click=move |ev| {
                             ev.stop_propagation();
@@ -13056,6 +13126,9 @@ fn App() -> impl IntoView {
                             let n = inbox_here_count.get();
                             (n > 0).then(|| view! { <span class="inbox-badge">{n}</span> })
                         }}
+                        {move || (inbox_here_count.get() == 0 && inbox_other_count.get() > 0).then(|| view! {
+                            <span class="inbox-other-dot" data-testid="inbox-other-dot"></span>
+                        })}
                     </button>
                     {move || inbox_open.get().then(|| view! {
                         <div class="inbox-drop" on:click=|ev| ev.stop_propagation()>

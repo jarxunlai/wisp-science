@@ -2978,6 +2978,24 @@ fn window_focus_tracking_survives_unordered_focus_handoff() {
     assert_reset();
 }
 
+#[test]
+fn session_notice_reaches_only_windows_of_other_projects() {
+    let active_projects = HashMap::from([
+        ("main".to_string(), "project-a".to_string()),
+        ("proj-b".to_string(), "project-b".to_string()),
+        ("proj-b2".to_string(), "project-b".to_string()),
+        ("proj-c".to_string(), "project-c".to_string()),
+        ("pet".to_string(), "project-a".to_string()),
+    ]);
+    assert_eq!(
+        super::foreign_notice_labels("project-b", &active_projects),
+        vec!["main".to_string(), "proj-c".to_string()],
+    );
+    // Only the owning project is open: nobody needs a cross-project notice.
+    let only_b = HashMap::from([("proj-b".to_string(), "project-b".to_string())]);
+    assert!(super::foreign_notice_labels("project-b", &only_b).is_empty());
+}
+
 // Foreground suppression is per session, not per app (#1619): the user working
 // in project A's window must still hear that project B's conversation ended.
 #[test]
