@@ -249,6 +249,12 @@ pub(crate) struct DynamicAgentTaskProposal {
     pub(crate) isolated: bool,
     #[serde(default)]
     pub(crate) model_id: Option<String>,
+    /// Parent-requested model class (`fast` worker model or `inherit` the
+    /// conversation's model); ignored when `model_id` or a Specialist binds one.
+    /// Omitted on the wire when unset so stored templates and the native
+    /// workflow-canvas contract keep their existing shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_tier: Option<wisp_core::ModelTier>,
     #[serde(default)]
     pub(crate) executor: Option<AgentExecutorSelection>,
     #[serde(default)]
@@ -401,6 +407,7 @@ pub(crate) async fn resolve_proposal(
                             output_schema: task.output_schema,
                             isolated: task.isolated,
                             model_id: task.model_id.filter(|value| !value.trim().is_empty()),
+                            model_tier: task.model_tier,
                             executor: task
                                 .executor
                                 .map(AgentExecutorSelection::into_ref)
@@ -604,6 +611,7 @@ pub(crate) fn summarize(
             model_id: requested
                 .map(|requested| requested.model_id.clone())
                 .unwrap_or_else(|| step.spec.model.clone()),
+            model_tier: None,
             executor: requested
                 .map(|requested| {
                     requested
@@ -982,6 +990,7 @@ mod tests {
             output_schema: None,
             isolated: false,
             model_id: None,
+            model_tier: None,
             executor: None,
             budget: None,
             timeout_secs: None,
@@ -1065,6 +1074,7 @@ mod tests {
             output_schema: None,
             isolated: false,
             model_id: None,
+            model_tier: None,
             executor: None,
             budget: None,
             timeout_secs: None,
@@ -1154,6 +1164,7 @@ mod tests {
                 },
             ],
             default_model_id: Some("enabled".into()),
+            inherit_model_id: None,
             permission_ceiling: wisp_core::PermissionSet::default(),
             context_ceiling: wisp_core::ContextPolicy::default(),
             budget_ceiling: AgentBudget::default(),
